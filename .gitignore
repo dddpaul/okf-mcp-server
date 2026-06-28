@@ -4,6 +4,16 @@ backlog/.ralph-run.log
 backlog/.ralph-launch.log
 backlog/.ralph-heartbeat
 
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # OS files
 .DS_Store
 
