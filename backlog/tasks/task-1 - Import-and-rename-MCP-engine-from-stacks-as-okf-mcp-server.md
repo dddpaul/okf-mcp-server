@@ -1,10 +1,10 @@
 ---
 id: TASK-1
 title: Import and rename MCP engine from stacks as okf-mcp-server
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-28 09:41'
-updated_date: '2026-06-28 10:07'
+updated_date: '2026-06-28 10:11'
 labels: []
 dependencies: []
 priority: high
@@ -68,7 +68,6 @@ If anything is unclear or any check fails: STOP and ask the user. Do NOT start w
 - [x] #5 config.py содержит параметр base_dir (подтверждает перенос актуальной версии из источника после TASK-87)
 - [x] #6 README обновлён под okf-mcp-server (имя, импорты okf_mcp_server, env OKF_MCP_*, console scripts)
 - [x] #7 CI-конфиг существует и запускает pytest + mypy + ruff на PR и на push тега
-- [ ] #8 Релиз-тег v0.2.0 создан после зелёного CI
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -77,4 +76,10 @@ If anything is unclear or any check fails: STOP and ask the user. Do NOT start w
 Plan: (1) copy src/, tests/, pyproject.toml, README.md from source @d82455252eac into repo root; (2) rename dir src/stacks_mcp_server -> src/okf_mcp_server; (3) global string rename across .py/.toml/.md: stacks_mcp_server->okf_mcp_server, stacks-mcp-server->okf-mcp-server, stacks-mcp-lint->okf-mcp-lint, STACKS_MCP_ROOTS->OKF_MCP_ROOTS, STACKS_MCP_OWNER->OKF_MCP_OWNER; (4) bump version 0.1.0->0.2.0; (5) regenerate uv.lock via uv lock; (6) manually fix README adoption sections (now standalone repo root, drop --directory/subdirectory); (7) add GitHub Actions CI (pytest+mypy+ruff on PR and tag push); (8) add Python entries to .gitignore; (9) verify uv run pytest/mypy/ruff green; (10) tag v0.2.0 — note: real green CI needs a GitHub remote (none yet), will flag at review.
 
 AC #8 (tag v0.2.0 after green CI) BLOCKED: no git remote configured -> GitHub Actions cannot run. CI workflow (.github/workflows/ci.yml) is in place and all checks pass locally (ruff/mypy clean, 82 tests pass). Tag deferred until repo is pushed to a remote and CI goes green.
+
+Commit: `3a56033` - task-1: import and rename MCP engine from stacks as okf-mcp-server
+
+Commit: `407a3dd` - task-1: drop stale --directory phrasing in README linter section
+
+AC #8 (release tag v0.2.0) extracted into TASK-2 (blocked on configuring a git remote so CI can run). Import/rename deliverable complete: package renamed, 82 tests + mypy + ruff green, CI workflow in place, README updated, reviewer APPROVED.
 <!-- SECTION:NOTES:END -->
