@@ -1,9 +1,10 @@
 ---
 id: TASK-2
 title: Tag and publish okf-mcp-server v0.2.0 release after green CI
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-28 10:11'
+updated_date: '2026-06-28 14:07'
 labels: []
 dependencies: []
 ordinal: 2000
@@ -21,7 +22,13 @@ Origin: AC #8 of TASK-1, deferred at merge time.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Repository has a git remote configured and the default branch is pushed
-- [ ] #2 CI workflow runs on the remote and is green (ruff + mypy + pytest all pass)
-- [ ] #3 Annotated tag v0.2.0 is created on the merge commit and pushed after CI is green
+- [x] #1 Repository has a git remote configured and the default branch is pushed
+- [x] #2 CI workflow runs on the remote and is green (ruff + mypy + pytest all pass)
+- [x] #3 Annotated tag v0.2.0 is created on the merge commit and pushed after CI is green
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Done: remote git@github.com:dddpaul/okf-mcp-server.git configured, master pushed (default branch). Annotated tag v0.2.0 pushed on merge commit e3ff5df; CI run 28324793291 GREEN (ruff+mypy+pytest, completed 19s). Note: workflow logs a non-blocking warning that actions/checkout@v4 + setup-uv@v5 target Node 20 (auto-run on Node 24) — cosmetic, no action required.
+<!-- SECTION:NOTES:END -->
