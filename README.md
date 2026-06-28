@@ -125,7 +125,7 @@ A companion CLI, `okf-mcp-lint`, enforces three frontmatter invariants over the 
 
 `id` derivation and `type-slug` derivation are imported directly from the server module (`extract_id`, `slugify_type`) — the linter never reimplements them, so a verdict from the linter implies the same outcome at server load time.
 
-Run it from the owner repo (point `--directory` at your okf-mcp-server checkout, or run `okf-mcp-lint` directly once installed):
+Run it from the owner repo (the `okf-mcp-lint` console script is available once the package is installed):
 
 ```sh
 okf-mcp-lint
