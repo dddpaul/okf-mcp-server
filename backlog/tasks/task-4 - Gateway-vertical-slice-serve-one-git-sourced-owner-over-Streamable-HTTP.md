@@ -4,6 +4,7 @@ title: 'Gateway vertical slice: serve one git-sourced owner over Streamable HTTP
 status: To Do
 assignee: []
 created_date: '2026-07-02 18:02'
+updated_date: '2026-07-02 20:30'
 labels:
   - 'feature:http-gateway'
 dependencies: []
@@ -28,4 +29,7 @@ US-001. Additive okf-mcp-gateway entry point. Serve ONE owner's docs over MCP St
 - [ ] #7 Existing 82 stdio tests still pass
 - [ ] #8 uv run mypy . and uv run ruff check . pass
 - [ ] #9 uv run pytest passes
+- [ ] #10 tests/conftest.py provides a reusable fixture that builds a file:// bare-repo git source (extending the existing git-init pattern), reused by this and later gateway tasks
+- [ ] #11 load_docs and build_server are reused with unchanged signatures by constructing a per-owner ServerConfig(owner=<name>, roots=(<checkout_path>,)) — no edits to those functions
+- [ ] #12 New runtime deps (starlette, uvicorn) are added via uv add and reflected in pyproject.toml and uv.lock
 <!-- AC:END -->

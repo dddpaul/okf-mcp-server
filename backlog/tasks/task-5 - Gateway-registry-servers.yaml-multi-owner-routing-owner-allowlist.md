@@ -4,6 +4,7 @@ title: 'Gateway registry (servers.yaml), multi-owner routing, owner allowlist'
 status: To Do
 assignee: []
 created_date: '2026-07-02 18:04'
+updated_date: '2026-07-02 20:30'
 labels:
   - 'feature:http-gateway'
 dependencies:
@@ -30,4 +31,5 @@ US-002. Introduce the servers.yaml registry and serve multiple owners, each at /
 - [ ] #8 Existing 82 stdio tests still pass
 - [ ] #9 uv run mypy . and uv run ruff check . pass
 - [ ] #10 uv run pytest passes
+- [ ] #11 New deps (pydantic, pyyaml) are added via uv add and reflected in pyproject.toml and uv.lock
 <!-- AC:END -->

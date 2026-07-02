@@ -4,6 +4,7 @@ title: 'Gateway pull-on-demand TTL cache and POST /{owner}/refresh'
 status: To Do
 assignee: []
 created_date: '2026-07-02 18:08'
+updated_date: '2026-07-02 20:30'
 labels:
   - 'feature:http-gateway'
 dependencies:
@@ -27,4 +28,5 @@ US-003. Serve committed content freshly-enough without pulling on every request,
 - [ ] #5 Existing 82 stdio tests still pass
 - [ ] #6 uv run mypy . and uv run ruff check . pass
 - [ ] #7 uv run pytest passes
+- [ ] #8 When both the owner ttl and defaults.ttl are omitted, the effective TTL default is 60 seconds, covered by a unit test
 <!-- AC:END -->

@@ -4,6 +4,7 @@ title: 'Gateway Docker packaging, compose, and README'
 status: To Do
 assignee: []
 created_date: '2026-07-02 18:09'
+updated_date: '2026-07-02 20:30'
 labels:
   - 'feature:http-gateway'
 dependencies:
@@ -29,4 +30,5 @@ US-005. Package the gateway as a supervised container and document how a devcont
 - [ ] #6 Existing 82 stdio tests still pass
 - [ ] #7 uv run mypy . and uv run ruff check . pass
 - [ ] #8 uv run pytest passes
+- [ ] #9 The task/README explicitly notes that docker compose up -d idempotency (no-op when already running) is a manual verification step, not gated by an offline AC
 <!-- AC:END -->
