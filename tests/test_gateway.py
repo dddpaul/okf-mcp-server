@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import httpx
@@ -24,7 +24,7 @@ from starlette.applications import Starlette
 from okf_mcp_server.gateway import Registry, create_app
 from okf_mcp_server.gateway import owner_cache as owner_cache_module
 from okf_mcp_server.gateway.git_source import clone_owner
-from okf_mcp_server.gateway.registry import OwnerSpec
+from okf_mcp_server.gateway.registry import Credential, OwnerSpec
 
 REFERENCE_DOC = """---
 export: true
@@ -82,6 +82,8 @@ FIXTURE_FILES = {
     "design/adr.md": DECISION_DOC,
     "README.md": NOT_EXPORTED,
 }
+
+NORTH_TOKEN = "north-secret-token"  # shared bearer token for US-004 auth tests
 
 
 def _expected_uris(owner: str) -> set[str]:
@@ -215,11 +217,18 @@ def test_slow_owner_does_not_block_healthz_or_other_owners(
     release = threading.Event()
     real_clone = clone_owner
 
-    def gated_clone(url: str, ref: str, dest: Path) -> Path:
+    def gated_clone(
+        url: str,
+        ref: str,
+        dest: Path,
+        *,
+        credentials: Mapping[str, Credential] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> Path:
         # Block the slow owner's clone (in a worker thread) until released.
         if url == slow.url:
             release.wait(timeout=30)
-        return real_clone(url, ref, dest)
+        return real_clone(url, ref, dest, credentials=credentials, env=env)
 
     monkeypatch.setattr(owner_cache_module, "clone_owner", gated_clone)
     app = create_app(_registry_for({"slow": slow, "fast": fast}), tmp_path / "cache")
@@ -334,6 +343,99 @@ def test_refresh_unknown_owner_returns_404(
     assert response.status_code == 404
 
 
+def test_missing_bearer_token_returns_401(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    app = create_app(
+        _registry_for({"acme": source}), tmp_path / "cache", auth_token=NORTH_TOKEN
+    )
+
+    mcp = asyncio.run(_request(app, "GET", "/acme/mcp"))
+    refresh = asyncio.run(_request(app, "POST", "/acme/refresh"))
+
+    assert mcp.status_code == 401
+    assert refresh.status_code == 401
+    assert mcp.headers.get("www-authenticate") == "Bearer"
+
+
+def test_wrong_bearer_token_returns_401(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    app = create_app(
+        _registry_for({"acme": source}), tmp_path / "cache", auth_token=NORTH_TOKEN
+    )
+
+    mcp = asyncio.run(_request(app, "GET", "/acme/mcp", token="not-the-token"))
+    refresh = asyncio.run(_request(app, "POST", "/acme/refresh", token="not-the-token"))
+
+    assert mcp.status_code == 401
+    assert refresh.status_code == 401
+
+
+def test_healthz_stays_open_when_auth_enabled(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    app = create_app(
+        _registry_for({"acme": source}), tmp_path / "cache", auth_token=NORTH_TOKEN
+    )
+
+    response = asyncio.run(_request(app, "GET", "/healthz"))
+
+    assert response.status_code == 200
+    assert response.text == "ok"
+
+
+def test_unauthenticated_request_hides_unknown_owner(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    app = create_app(
+        _registry_for({"acme": source}), tmp_path / "cache", auth_token=NORTH_TOKEN
+    )
+
+    # Auth runs before routing: an unknown owner is 401 (not 404) without a token,
+    # so an unauthenticated caller cannot probe which owners exist.
+    without_token = asyncio.run(_request(app, "GET", "/ghost/mcp"))
+    with_token = asyncio.run(_request(app, "GET", "/ghost/mcp", token=NORTH_TOKEN))
+
+    assert without_token.status_code == 401
+    assert with_token.status_code == 404
+
+
+def test_valid_bearer_token_serves_mcp_and_refresh(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    app = create_app(
+        _registry_for({"acme": source}), tmp_path / "cache", auth_token=NORTH_TOKEN
+    )
+
+    async def scenario() -> tuple[set[str], int]:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://gateway.test",
+                headers={"Authorization": f"Bearer {NORTH_TOKEN}"},
+            ) as http_client:
+                uris = await _list_owner(http_client, "acme")
+                refresh = await http_client.post("/acme/refresh")
+                return uris, refresh.status_code
+
+    uris, refresh_status = asyncio.run(scenario())
+
+    assert uris == _expected_uris("acme")  # a valid token lets the MCP session run
+    assert refresh_status == 200  # ...and reach POST /{owner}/refresh
+
+
 async def _get(app: Starlette, path: str) -> httpx.Response:
     """GET ``path`` in-process, with the app lifespan running (app is 'up')."""
     transport = httpx.ASGITransport(app=app)
@@ -342,6 +444,19 @@ async def _get(app: Starlette, path: str) -> httpx.Response:
             transport=transport, base_url="http://gateway.test"
         ) as http_client:
             return await http_client.get(path)
+
+
+async def _request(
+    app: Starlette, method: str, path: str, *, token: str | None = None
+) -> httpx.Response:
+    """Issue one ``method`` request to ``path``, optionally bearer-authenticated."""
+    transport = httpx.ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://gateway.test", headers=headers
+        ) as http_client:
+            return await http_client.request(method, path)
 
 
 async def _drive_mcp(

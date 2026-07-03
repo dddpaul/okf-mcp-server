@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +28,7 @@ from mcp.server import Server
 from ..config import ServerConfig
 from ..server import ParsedDoc, build_server, load_docs
 from .git_source import clone_owner, fetch_and_reset, head_commit
-from .registry import ResolvedOwner
+from .registry import Credential, ResolvedOwner
 
 
 @dataclass(frozen=True)
@@ -88,6 +88,8 @@ class OwnerCache:
         dest: Path,
         *,
         clock: Callable[[], float] = time.monotonic,
+        credentials: Mapping[str, Credential] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         """Initialize an unloaded cache for one owner.
 
@@ -96,10 +98,15 @@ class OwnerCache:
             dest: Target checkout directory.
             clock: Monotonic-seconds source for TTL staleness; injectable so
                 tests advance time deterministically. Defaults to ``time.monotonic``.
+            credentials: Per-host git credentials from the registry, injected into
+                the clone/fetch URLs per invocation; defaults to none (public repos).
+            env: Environment the tokens are read from; defaults to ``os.environ``.
         """
         self.resolved = resolved
         self.dest = dest
         self._clock = clock
+        self._credentials = credentials or {}
+        self._env = env
         self.lock = asyncio.Lock()
         self.checkout: Path | None = None
         self.docs: list[ParsedDoc] = []
@@ -175,7 +182,13 @@ class OwnerCache:
 
     def _clone_blocking(self) -> _PullOutcome:
         """Shallow-clone the owner and build its server (runs in a worker thread)."""
-        checkout = clone_owner(self.resolved.url, self.resolved.ref, self.dest)
+        checkout = clone_owner(
+            self.resolved.url,
+            self.resolved.ref,
+            self.dest,
+            credentials=self._credentials,
+            env=self._env,
+        )
         docs = self._scan_docs(checkout)
         return _PullOutcome(
             checkout=checkout,
@@ -194,7 +207,13 @@ class OwnerCache:
         checkout = self.checkout
         assert checkout is not None  # load() ran first; app gates on readiness
         before = self.commit
-        fetch_and_reset(checkout, self.resolved.ref)
+        fetch_and_reset(
+            checkout,
+            self.resolved.ref,
+            self.resolved.url,
+            credentials=self._credentials,
+            env=self._env,
+        )
         after = head_commit(checkout)
         if after == before and self.server is not None:
             # Unchanged tree: reuse the built docs/server, skip load+build cost.

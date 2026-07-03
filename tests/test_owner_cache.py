@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
@@ -21,7 +21,7 @@ from conftest import FakeClock, GitRepoFixture, push_commit
 
 from okf_mcp_server.gateway import owner_cache as owner_cache_module
 from okf_mcp_server.gateway.owner_cache import OwnerCache, RefreshResult
-from okf_mcp_server.gateway.registry import ResolvedOwner
+from okf_mcp_server.gateway.registry import Credential, ResolvedOwner
 
 REFERENCE_DOC = """---
 export: true
@@ -195,12 +195,19 @@ def test_concurrent_stale_requests_pull_once(
     fetch_calls: list[str] = []
     real_fetch = owner_cache_module.fetch_and_reset
 
-    def spy_fetch(checkout: Path, ref: str) -> None:
+    def spy_fetch(
+        checkout: Path,
+        ref: str,
+        url: str,
+        *,
+        credentials: Mapping[str, Credential] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
         fetch_calls.append(ref)
         # Widen the overlap window so the second request is parked on the lock
         # (runs in the worker thread, so the event loop stays free).
         time.sleep(0.05)
-        real_fetch(checkout, ref)
+        real_fetch(checkout, ref, url, credentials=credentials, env=env)
 
     monkeypatch.setattr(owner_cache_module, "fetch_and_reset", spy_fetch)
 
@@ -232,11 +239,18 @@ def test_pull_on_one_owner_does_not_block_another(
     gate = threading.Event()
     real_fetch = owner_cache_module.fetch_and_reset
 
-    def gated_fetch(checkout: Path, ref: str) -> None:
+    def gated_fetch(
+        checkout: Path,
+        ref: str,
+        url: str,
+        *,
+        credentials: Mapping[str, Credential] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
         # Block only the slow owner's fetch (in its worker thread) until released.
         if checkout == slow.checkout:
             assert gate.wait(timeout=30)
-        real_fetch(checkout, ref)
+        real_fetch(checkout, ref, url, credentials=credentials, env=env)
 
     monkeypatch.setattr(owner_cache_module, "fetch_and_reset", gated_fetch)
 
