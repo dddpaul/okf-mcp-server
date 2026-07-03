@@ -15,14 +15,22 @@ Content is kept freshly-enough by a per-owner TTL cache (US-003): each
 ``/{owner}/mcp`` request first pulls the owner if it is staler than its TTL, and
 ``POST /{owner}/refresh`` forces an immediate pull. When a pull rebuilds an
 owner's server, the owner's session manager is re-pointed at the fresh build so
-subsequent MCP sessions serve the new content. Auth and Docker packaging arrive
-in later tasks.
+subsequent MCP sessions serve the new content.
+
+North consumer auth (US-004) is a single ASGI choke point,
+:class:`BearerAuthMiddleware`: when a shared token is configured, every route
+except ``GET /healthz`` requires ``Authorization: Bearer <token>`` and is
+rejected with 401 otherwise. It runs outside the router, so an unauthenticated
+caller is turned away before owner routing and cannot even probe which owners
+exist. South git-host auth lives in :mod:`.git_source`; Docker packaging arrives
+in a later task.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import secrets
 import sys
 import time
 from collections.abc import AsyncIterator, Callable
@@ -30,10 +38,12 @@ from pathlib import Path
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .owner_cache import OwnerCache
 from .registry import Registry
@@ -133,11 +143,54 @@ class _MCPRouter:
         await state.session_manager.handle_request(scope, receive, send)
 
 
+class BearerAuthMiddleware:
+    """Single north auth choke point: shared bearer token on all but ``/healthz``.
+
+    Wraps the whole app outside the router, so a request with a missing or wrong
+    ``Authorization: Bearer <token>`` header is rejected with 401 before any owner
+    routing runs — an unauthenticated caller cannot distinguish a registered owner
+    from an unknown one. ``GET /healthz`` is exempt so container health checks
+    stay open. The token comparison is constant-time to avoid leaking it by timing.
+
+    Attributes:
+        token: The expected shared bearer token.
+    """
+
+    def __init__(self, app: ASGIApp, token: str) -> None:
+        self._app = app
+        self._token = token
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] == "/healthz":
+            await self._app(scope, receive, send)
+            return
+        if not self._authorized(scope):
+            response = PlainTextResponse(
+                "unauthorized",
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+        await self._app(scope, receive, send)
+
+    def _authorized(self, scope: Scope) -> bool:
+        """Return whether the request carries the expected ``Bearer`` token."""
+        header = Headers(scope=scope).get("authorization", "")
+        scheme, _, credential = header.partition(" ")
+        if scheme.lower() != "bearer":
+            return False
+        return secrets.compare_digest(
+            credential.encode("utf-8"), self._token.encode("utf-8")
+        )
+
+
 def create_app(
     registry: Registry,
     cache_dir: Path,
     *,
     clock: Callable[[], float] = time.monotonic,
+    auth_token: str | None = None,
 ) -> Starlette:
     """Build the multi-owner gateway app from a validated registry.
 
@@ -147,10 +200,14 @@ def create_app(
     request is TTL-gated and ``POST /{owner}/refresh`` forces a pull.
 
     Args:
-        registry: Validated registry; its owners form the allowlist.
+        registry: Validated registry; its owners form the allowlist and its
+            per-host ``credentials`` are injected into each owner's clone/fetch.
         cache_dir: Directory under which per-owner checkouts are written.
         clock: Monotonic-seconds source threaded into every owner's TTL cache;
             injectable so tests drive staleness deterministically.
+        auth_token: Shared north bearer token; when set, every route except
+            ``GET /healthz`` requires it. ``None`` (the default) leaves the app
+            open, which the console entry point forbids in production.
 
     Returns:
         A configured Starlette application.
@@ -160,7 +217,12 @@ def create_app(
         resolved = registry.resolve(name)
         if resolved is None:  # unreachable: name comes from registry.owners
             continue
-        cache = OwnerCache(resolved, cache_dir / name, clock=clock)
+        cache = OwnerCache(
+            resolved,
+            cache_dir / name,
+            clock=clock,
+            credentials=registry.credentials,
+        )
         owners[name] = OwnerState(cache)
 
     async def healthz(request: Request) -> PlainTextResponse:
@@ -205,17 +267,22 @@ def create_app(
             shutdown.set()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    middleware = (
+        [Middleware(BearerAuthMiddleware, token=auth_token)] if auth_token else []
+    )
     app = Starlette(
         routes=[
             Route("/healthz", healthz, methods=["GET"]),
             Route("/{owner}/refresh", refresh, methods=["POST"]),
             Route("/{owner}/mcp", endpoint=_MCPRouter(owners)),
         ],
+        middleware=middleware,
         lifespan=lifespan,
     )
-    # Surface per-owner state for tests/introspection.
+    # Surface per-owner state and auth posture for tests/introspection.
     app.state.owners = owners
+    app.state.auth_required = bool(auth_token)
     return app
 
 
-__all__ = ["OwnerState", "create_app"]
+__all__ = ["BearerAuthMiddleware", "OwnerState", "create_app"]

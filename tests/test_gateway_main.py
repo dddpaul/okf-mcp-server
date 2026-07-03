@@ -25,6 +25,7 @@ def test_main_exits_fast_on_missing_servers_yaml(
 ) -> None:
     calls: list[tuple[Any, ...]] = []
     monkeypatch.setattr(main_module.uvicorn, "run", lambda *a, **k: calls.append(a))
+    monkeypatch.setenv("OKF_GATEWAY_TOKEN", "north-secret")
     monkeypatch.setenv("OKF_GATEWAY_SERVERS", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("OKF_GATEWAY_CACHE_DIR", str(tmp_path / "cache"))
 
@@ -33,6 +34,27 @@ def test_main_exits_fast_on_missing_servers_yaml(
 
     assert excinfo.value.code == 1
     assert calls == []  # aborted before ever reaching uvicorn.run
+
+
+def test_main_exits_fast_without_north_token(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_bare_repo({"docs/x.md": "# x\n"}, ref="main")
+    servers = tmp_path / "servers.yaml"
+    servers.write_text(f"owners:\n  acme:\n    url: {source.url}\n", encoding="utf-8")
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(main_module.uvicorn, "run", lambda *a, **k: calls.append(a))
+    monkeypatch.delenv("OKF_GATEWAY_TOKEN", raising=False)  # no consumer auth token
+    monkeypatch.setenv("OKF_GATEWAY_SERVERS", str(servers))
+    monkeypatch.setenv("OKF_GATEWAY_CACHE_DIR", str(tmp_path / "cache"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        main_module.main()
+
+    assert excinfo.value.code == 1
+    assert calls == []  # refuses to serve without a north bearer token
 
 
 def test_main_builds_multi_owner_app_from_registry(
@@ -49,6 +71,7 @@ def test_main_builds_multi_owner_app_from_registry(
     monkeypatch.setattr(
         main_module.uvicorn, "run", lambda app, **k: served.append(app)
     )
+    monkeypatch.setenv("OKF_GATEWAY_TOKEN", "north-secret")
     monkeypatch.setenv("OKF_GATEWAY_SERVERS", str(servers))
     monkeypatch.setenv("OKF_GATEWAY_CACHE_DIR", str(tmp_path / "cache"))
 
@@ -56,3 +79,4 @@ def test_main_builds_multi_owner_app_from_registry(
 
     assert len(served) == 1
     assert set(served[0].state.owners) == {"acme"}
+    assert served[0].state.auth_required is True  # north bearer auth is wired on
