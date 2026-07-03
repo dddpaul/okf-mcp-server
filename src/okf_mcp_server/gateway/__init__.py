@@ -10,10 +10,13 @@ from __future__ import annotations
 
 from .app import create_app
 from .config import GatewayConfig
+from .owner_cache import OwnerCache, RefreshResult
 from .registry import Registry, RegistryError, load_registry
 
 __all__ = [
     "GatewayConfig",
+    "OwnerCache",
+    "RefreshResult",
     "Registry",
     "RegistryError",
     "create_app",
