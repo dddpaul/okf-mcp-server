@@ -1,14 +1,21 @@
 """okf-mcp-gateway — additive MCP Streamable HTTP gateway over the stdio core.
 
 This package wraps the existing stdio engine (``load_docs`` / ``build_server``)
-without modifying it, serving one git-sourced owner over MCP Streamable HTTP at
-``/{owner}/mcp``. Multi-owner routing, auth, TTL refresh, and Docker packaging
-arrive in later tasks.
+without modifying it, serving each registered owner over MCP Streamable HTTP at
+``/{owner}/mcp``. Owners are declared in ``servers.yaml`` (the owner allowlist);
+auth, TTL refresh, and Docker packaging arrive in later tasks.
 """
 
 from __future__ import annotations
 
 from .app import create_app
 from .config import GatewayConfig
+from .registry import Registry, RegistryError, load_registry
 
-__all__ = ["GatewayConfig", "create_app"]
+__all__ = [
+    "GatewayConfig",
+    "Registry",
+    "RegistryError",
+    "create_app",
+    "load_registry",
+]
