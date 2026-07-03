@@ -1,0 +1,16 @@
+# Keep the build context lean: only pyproject.toml, uv.lock, and src/ are COPYed.
+.git
+.venv
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+dist
+*.egg-info
+.env
+backlog
+tests
+design
+.devcontainer
+.github
