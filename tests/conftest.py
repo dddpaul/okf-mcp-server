@@ -38,6 +38,24 @@ def sample_repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return target
 
 
+class FakeClock:
+    """Deterministic monotonic-seconds source with manual advance.
+
+    Injected into :class:`~okf_mcp_server.gateway.owner_cache.OwnerCache` (and the
+    gateway app) so TTL staleness is driven explicitly in tests instead of by
+    sleeping on wall-clock time.
+    """
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 @dataclass(frozen=True)
 class GitRepoFixture:
     """A ``file://`` bare git repo usable as a gateway clone source.
@@ -97,3 +115,45 @@ def make_bare_repo(
         )
 
     return _make
+
+
+def push_commit(
+    source: GitRepoFixture, files: dict[str, str], message: str = "update"
+) -> str:
+    """Commit ``files`` onto ``source``'s work tree and push to its bare repo.
+
+    Lets a gateway refresh test mutate a ``file://`` clone source *after* the
+    gateway has already cloned it, so a subsequent fetch/reset observes the new
+    commit. ``files`` maps ``relative path -> content`` (adds or overwrites).
+
+    Args:
+        source: A bare-repo fixture from :func:`make_bare_repo`.
+        files: New/updated files to commit, keyed by path relative to the work tree.
+        message: Commit message.
+
+    Returns:
+        The new ``HEAD`` commit SHA now at the bare repo's tip.
+    """
+    for rel, content in files.items():
+        path = source.work_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    subprocess.run(["git", "add", "-A"], cwd=source.work_dir, check=True)
+    subprocess.run(
+        ["git", *_GIT_IDENTITY, "commit", "-q", "-m", message],
+        cwd=source.work_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", str(source.bare_dir), source.ref],
+        cwd=source.work_dir,
+        check=True,
+    )
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source.work_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()

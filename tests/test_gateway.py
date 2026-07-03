@@ -1,8 +1,9 @@
-"""US-002: multi-owner registry routing over Streamable HTTP.
+"""US-002/US-003: multi-owner routing, TTL refresh, and ``/{owner}/refresh``.
 
 Every test is offline — ``file://`` bare-repo fixtures are the clone sources and
 the Starlette app is driven in-process over ``httpx.ASGITransport``. No live git
-host, network, or secrets are involved.
+host, network, or secrets are involved. TTL freshness is driven by an injected
+``FakeClock`` rather than by sleeping on wall-clock time.
 """
 
 from __future__ import annotations
@@ -15,13 +16,13 @@ from pathlib import Path
 
 import httpx
 import pytest
-from conftest import GitRepoFixture
+from conftest import FakeClock, GitRepoFixture, push_commit
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from starlette.applications import Starlette
 
 from okf_mcp_server.gateway import Registry, create_app
-from okf_mcp_server.gateway import app as app_module
+from okf_mcp_server.gateway import owner_cache as owner_cache_module
 from okf_mcp_server.gateway.git_source import clone_owner
 from okf_mcp_server.gateway.registry import OwnerSpec
 
@@ -51,6 +52,29 @@ The gateway decision body.
 NOT_EXPORTED = """# Just a readme
 
 No frontmatter, so it must not be served.
+"""
+
+CHANGED_REFERENCE_DOC = """---
+export: true
+type: Reference Doc
+id: gw-ref-1
+title: Gateway Reference
+description: Reference served over the gateway.
+---
+# Gateway Reference
+
+UPDATED gateway reference body.
+"""
+
+NEW_RUNBOOK_DOC = """---
+export: true
+type: Runbook
+id: gw-run-1
+title: Gateway Runbook
+---
+# Gateway Runbook
+
+A third exported doc, added after the initial clone.
 """
 
 FIXTURE_FILES = {
@@ -197,7 +221,7 @@ def test_slow_owner_does_not_block_healthz_or_other_owners(
             release.wait(timeout=30)
         return real_clone(url, ref, dest)
 
-    monkeypatch.setattr(app_module, "clone_owner", gated_clone)
+    monkeypatch.setattr(owner_cache_module, "clone_owner", gated_clone)
     app = create_app(_registry_for({"slow": slow, "fast": fast}), tmp_path / "cache")
 
     async def scenario() -> None:
@@ -222,6 +246,92 @@ def test_slow_owner_does_not_block_healthz_or_other_owners(
                     release.set()  # let the slow clone finish for clean shutdown
 
     asyncio.run(scenario())
+
+
+def test_ttl_gate_reflects_change_over_mcp(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    clock = FakeClock()
+    # No per-owner ttl => registry default (60s) applies.
+    app = create_app(_registry_for({"acme": source}), tmp_path / "cache", clock=clock)
+    ref_uri = "knowledge://acme/reference-doc/gw-ref-1"
+
+    async def scenario() -> tuple[str | None, str | None, str | None]:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as http_client:
+                _u0, c0 = await _list_and_read(http_client, "acme")
+                # Mutate the source only after the initial clone.
+                push_commit(source, {"docs/reference.md": CHANGED_REFERENCE_DOC})
+                clock.advance(30)  # within ttl=60 -> stale content still served
+                _u1, c1 = await _list_and_read(http_client, "acme")
+                clock.advance(40)  # now 70s old -> re-pull on next request
+                _u2, c2 = await _list_and_read(http_client, "acme")
+                return c0[ref_uri], c1[ref_uri], c2[ref_uri]
+
+    before, within, after = asyncio.run(scenario())
+
+    assert before is not None and "Body of the gateway reference doc." in before
+    assert within == before  # within TTL: no re-pull, content unchanged
+    assert after is not None and "UPDATED gateway reference body." in after
+
+
+def test_refresh_forces_pull_within_ttl_and_returns_summary(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    clock = FakeClock()
+    app = create_app(_registry_for({"acme": source}), tmp_path / "cache", clock=clock)
+
+    async def scenario() -> tuple[httpx.Response, str, set[str]]:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as http_client:
+                new_head = push_commit(source, {"docs/runbook.md": NEW_RUNBOOK_DOC})
+                # No clock advance: still within TTL, so only a force pull refreshes.
+                response = await http_client.post("/acme/refresh")
+                uris = await _list_owner(http_client, "acme")
+                return response, new_head, uris
+
+    response, new_head, uris = asyncio.run(scenario())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "owner": "acme",
+        "ref": "main",
+        "commit": new_head,
+        "docs_loaded": 3,  # reference + adr + newly added runbook
+    }
+    # The forced pull is reflected in what the owner now serves over MCP.
+    assert "knowledge://acme/runbook/gw-run-1" in uris
+
+
+def test_refresh_unknown_owner_returns_404(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    app = create_app(_registry_for({"acme": source}), tmp_path / "cache")
+
+    async def scenario() -> httpx.Response:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as http_client:
+                return await http_client.post("/ghost/refresh")
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 404
 
 
 async def _get(app: Starlette, path: str) -> httpx.Response:

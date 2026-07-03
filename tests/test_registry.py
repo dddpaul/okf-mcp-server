@@ -83,6 +83,19 @@ def test_defaults_block_is_optional(tmp_path: Path) -> None:
     assert solo.ttl == DEFAULT_TTL  # built-in fallback (60)
 
 
+def test_omitted_ttl_defaults_to_60_seconds(tmp_path: Path) -> None:
+    # US-003 AC#8: with both the owner ttl and defaults.ttl omitted, the
+    # effective TTL is 60s. Pin the literal so a change to the default is caught
+    # (test_defaults_block_is_optional only compares against the symbol).
+    reg = load_registry(
+        _write(tmp_path, "owners:\n  solo:\n    url: file:///srv/solo.git\n")
+    )
+
+    resolved = reg.resolve("solo")
+    assert resolved is not None
+    assert resolved.ttl == 60
+
+
 def test_credentials_section_is_optional(tmp_path: Path) -> None:
     reg = load_registry(
         _write(tmp_path, "owners:\n  solo:\n    url: file:///srv/solo.git\n")
