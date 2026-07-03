@@ -1,0 +1,32 @@
+# Owner allowlist for okf-mcp-gateway — the set of repos it serves and the
+# north routing allowlist (a request for an owner absent here gets 404).
+#
+# This file has NO secrets: `credentials` names the *environment variable*
+# (token_env, set in .env) that holds each host's token, never the token itself.
+# It is mounted read-only into the container at /app/servers.yaml. Replace the
+# example owners below with your own.
+
+# Applied to any owner that omits ref/ttl.
+defaults:
+  ref: main
+  ttl: 60 # seconds; per-owner staleness bound before the next pull-on-demand
+
+owners:
+  # A public repo, cloned anonymously (no credentials entry for its host):
+  acme:
+    url: https://git.example.invalid/acme/knowledge.git
+    ref: main
+
+  # A private repo on a host with a credentials entry below; ref/ttl overrides:
+  beta:
+    url: https://bitbucket.example.invalid/beta/knowledge.git
+    ref: release
+    ttl: 120
+
+# Per git host. token_env names the .env variable holding a read-only token;
+# token_user is the provider-fixed username (x-token-auth for Bitbucket,
+# x-access-token for GitHub, oauth2 for GitLab).
+credentials:
+  bitbucket.example.invalid:
+    token_env: OKF_GIT_TOKEN_BITBUCKET
+    token_user: x-token-auth

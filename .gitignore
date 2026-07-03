@@ -17,6 +17,9 @@ dist/
 # OS files
 .DS_Store
 
+# Gateway secrets (real tokens); the committed template is .env.example
+.env
+
 # Claude Code (ignore local overrides, track project config)
 .claude/*
 !.claude/settings.json

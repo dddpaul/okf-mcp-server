@@ -1,0 +1,47 @@
+# Supervised deployment of the okf-mcp-gateway.
+#
+# Docker is the cross-platform keep-alive: `restart: unless-stopped` brings the
+# gateway back after a crash or host reboot (no launchd/systemd), and
+# `docker compose up -d` is idempotent — a no-op when the service is already
+# running. Bringing it up / building the image is a manual step (it pulls base
+# images and clones owner repos over the network); `docker compose config`
+# validates this file offline.
+#
+# Secrets live in .env (create it from .env.example: `cp .env.example .env`);
+# the owner allowlist lives in servers.yaml (mounted read-only). Neither the
+# owner list nor any secret is baked into the image.
+services:
+  gateway:
+    build: .
+    image: okf-mcp-gateway
+    # Cross-platform keep-alive: restart after crash or host reboot.
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # Secrets: OKF_GATEWAY_TOKEN (north bearer) + OKF_GIT_TOKEN_* (south git).
+    # required: false lets `docker compose config` validate before .env exists.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      OKF_GATEWAY_SERVERS: /app/servers.yaml
+      OKF_GATEWAY_CACHE_DIR: /var/cache/okf-mcp-gateway
+    volumes:
+      # Named volume persists per-owner checkouts across restarts/redeploys.
+      - okf-checkouts:/var/cache/okf-mcp-gateway
+      # Owner allowlist, read-only — the container never writes it.
+      - ./servers.yaml:/app/servers.yaml:ro
+    # Unauthenticated liveness probe; /healthz is exempt from north bearer auth.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://localhost:8080/healthz")
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  okf-checkouts:

@@ -106,6 +106,114 @@ if __name__ == "__main__":
     run()
 ```
 
+## Gateway (Streamable HTTP, multi-owner)
+
+Everything above runs the server **per owner over stdio**. The gateway is the
+other deployment mode: **one supervised container** that serves *many* owners
+over **MCP Streamable HTTP**, so a team points its clients at a single always-on
+endpoint instead of spawning a stdio process per repo.
+
+- **Git-sourced, no mounts.** The gateway shallow-clones each owner's repo into a
+  container-private cache volume and reuses the exact stdio core (`load_docs` +
+  `build_server`) against the checkout. There are no source or consumer mounts.
+- **Path-routed allowlist.** Each owner is reachable at `/{owner}/mcp`; the
+  `servers.yaml` registry *is* the allowlist — an unregistered owner gets 404.
+- **Fresh enough.** Each request pulls the owner if it is staler than its TTL
+  (default 60s); `POST /{owner}/refresh` forces an immediate pull.
+- **Auth.** A single shared **north** bearer token guards every route except
+  `GET /healthz`; **south** per-host git tokens are injected into clone/fetch
+  URLs only and never persisted to `.git/config`.
+
+### `servers.yaml`
+
+The owner allowlist. It holds **no secrets** — `credentials` names the
+*environment variable* (`token_env`) that carries each host's token. Mounted
+read-only into the container. A committed sample lives at
+[`servers.yaml`](servers.yaml):
+
+```yaml
+defaults:
+  ref: main            # branch/tag checked out when an owner omits its own
+  ttl: 60              # per-owner staleness bound (seconds) before the next pull
+
+owners:
+  acme:                # reachable at /acme/mcp
+    url: https://git.example.invalid/acme/knowledge.git
+  beta:
+    url: https://bitbucket.example.invalid/beta/knowledge.git
+    ref: release       # optional per-owner override of defaults.ref
+    ttl: 120           # optional per-owner override of defaults.ttl
+
+credentials:           # per git host; consumed only for authenticated clones
+  bitbucket.example.invalid:
+    token_env: OKF_GIT_TOKEN_BITBUCKET   # the .env var holding the token
+    token_user: x-token-auth             # provider-fixed username
+```
+
+### Environment variables
+
+Secrets live in `.env` (copy it from [`.env.example`](.env.example):
+`cp .env.example .env`); `.env` is gitignored.
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `OKF_GATEWAY_TOKEN` | **yes** | — | North bearer token; the gateway refuses to start without it. |
+| `OKF_GIT_TOKEN_*` | as needed | — | South per-host git tokens, referenced by `credentials.token_env` in `servers.yaml`. |
+| `OKF_GATEWAY_SERVERS` | no | `servers.yaml` | Path to the registry. |
+| `OKF_GATEWAY_CACHE_DIR` | no | XDG cache | Directory for per-owner checkouts. |
+| `OKF_GATEWAY_HOST` | no | `0.0.0.0` | Bind host. |
+| `OKF_GATEWAY_PORT` | no | `8080` | Bind port. |
+
+### Run it with Docker
+
+Docker is the cross-platform keep-alive (`restart: unless-stopped`) — no
+launchd/systemd. Bring it up from the repo root:
+
+```sh
+cp .env.example .env          # then set OKF_GATEWAY_TOKEN (and any OKF_GIT_TOKEN_*)
+# edit servers.yaml to list your owners
+docker compose up -d
+```
+
+`docker compose up -d` is **idempotent** — run it again and it is a no-op when the
+service is already running, so it doubles as the redeploy command.
+
+> **Manual verification, not an offline gate.** The actual `docker build` /
+> `docker compose up -d` — and the idempotent no-op-when-already-running behavior
+> — pull base images and clone owner repos over the network, so they are a
+> **manual** step. What the automated (offline) gate covers is `docker compose
+> config` plus file/content checks (see `tests/test_docker_packaging.py`).
+
+Health and lifecycle:
+
+```sh
+curl -fsS http://localhost:8080/healthz               # -> ok (no auth)
+curl -X POST http://localhost:8080/acme/refresh \
+  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # force a pull
+```
+
+### Point a consumer at it
+
+From a devcontainer or host, reach the gateway at `host.docker.internal` and send
+the north bearer token. A project-level `.mcp.json` entry (Claude Code):
+
+```json
+{
+  "mcpServers": {
+    "acme-knowledge": {
+      "type": "http",
+      "url": "http://host.docker.internal:8080/acme/mcp",
+      "headers": {
+        "Authorization": "Bearer ${OKF_GATEWAY_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Swap `acme` for the owner you want and set `OKF_GATEWAY_TOKEN` in the consumer's
+environment to the same shared token the gateway runs with.
+
 ## Known limitations
 
 - **Single-process per owner.** One running process serves exactly one git repo. Multi-owner federation is achieved by running one shim per owner; there is no built-in aggregator.
