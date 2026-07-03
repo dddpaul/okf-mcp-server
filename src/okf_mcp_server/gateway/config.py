@@ -1,14 +1,12 @@
-"""Minimal gateway configuration for the single-owner vertical slice (US-001).
+"""Process-level configuration for the multi-owner gateway (US-002).
 
-The full multi-owner registry (``servers.yaml``) arrives in a later task; this
-module resolves exactly one owner from environment variables so the thin slice
-can serve a single git-sourced owner end to end.
+Owners themselves are declared in ``servers.yaml`` (see :mod:`.registry`); this
+module resolves only where that file lives and where checkouts are cached, from
+environment variables.
 
 Environment variables:
-    ``OKF_GATEWAY_OWNER``    Owner segment used in resource URIs and the route.
-    ``OKF_GATEWAY_GIT_URL``  Git URL to shallow-clone the owner's docs from.
-    ``OKF_GATEWAY_GIT_REF``  Branch or tag to check out (default: ``main``).
-    ``OKF_GATEWAY_CACHE_DIR``Cache directory for checkouts (default: XDG cache).
+    ``OKF_GATEWAY_SERVERS``   Path to ``servers.yaml`` (default: ``servers.yaml``).
+    ``OKF_GATEWAY_CACHE_DIR`` Cache directory for checkouts (default: XDG cache).
 """
 
 from __future__ import annotations
@@ -17,12 +15,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-ENV_OWNER = "OKF_GATEWAY_OWNER"
-ENV_GIT_URL = "OKF_GATEWAY_GIT_URL"
-ENV_GIT_REF = "OKF_GATEWAY_GIT_REF"
+ENV_SERVERS = "OKF_GATEWAY_SERVERS"
 ENV_CACHE_DIR = "OKF_GATEWAY_CACHE_DIR"
 
-DEFAULT_REF = "main"
+DEFAULT_SERVERS = "servers.yaml"
 
 
 def _default_cache_dir(env: dict[str, str]) -> Path:
@@ -33,18 +29,14 @@ def _default_cache_dir(env: dict[str, str]) -> Path:
 
 @dataclass(frozen=True)
 class GatewayConfig:
-    """Resolved configuration for a single owner served by the gateway.
+    """Resolved process configuration for the gateway.
 
     Attributes:
-        owner: Owner segment used in resource URIs and the ``/{owner}/mcp`` route.
-        git_url: Git URL cloned to source the owner's docs.
-        ref: Branch or tag checked out from ``git_url``.
+        servers_path: Path to the ``servers.yaml`` registry to load at startup.
         cache_dir: Directory under which per-owner checkouts are written.
     """
 
-    owner: str
-    git_url: str
-    ref: str
+    servers_path: Path
     cache_dir: Path
 
     @classmethod
@@ -55,29 +47,18 @@ class GatewayConfig:
             env: Environment mapping; defaults to ``os.environ``.
 
         Returns:
-            A validated ``GatewayConfig``.
-
-        Raises:
-            ValueError: If ``OKF_GATEWAY_OWNER`` or ``OKF_GATEWAY_GIT_URL`` is
-                missing or blank.
+            A resolved ``GatewayConfig``.
         """
         environ = dict(os.environ) if env is None else env
-        owner = environ.get(ENV_OWNER, "").strip()
-        if not owner:
-            raise ValueError(f"{ENV_OWNER} is required")
-        git_url = environ.get(ENV_GIT_URL, "").strip()
-        if not git_url:
-            raise ValueError(f"{ENV_GIT_URL} is required")
-        ref = environ.get(ENV_GIT_REF, "").strip() or DEFAULT_REF
+        servers_raw = environ.get(ENV_SERVERS, "").strip()
+        servers_path = Path(servers_raw) if servers_raw else Path(DEFAULT_SERVERS)
         cache_raw = environ.get(ENV_CACHE_DIR, "").strip()
         cache_dir = Path(cache_raw) if cache_raw else _default_cache_dir(environ)
-        return cls(owner=owner, git_url=git_url, ref=ref, cache_dir=cache_dir)
+        return cls(servers_path=servers_path, cache_dir=cache_dir)
 
 
 __all__ = [
     "ENV_CACHE_DIR",
-    "ENV_GIT_REF",
-    "ENV_GIT_URL",
-    "ENV_OWNER",
+    "ENV_SERVERS",
     "GatewayConfig",
 ]
