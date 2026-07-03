@@ -59,14 +59,12 @@ class _PullOutcome:
         docs: Docs to serve (freshly scanned, or reused when the tree is unchanged).
         server: MCP server to serve (rebuilt only when the tree changed).
         commit: ``HEAD`` commit SHA after the operation.
-        changed: Whether the commit moved (i.e. docs/server were rebuilt).
     """
 
     checkout: Path
     docs: list[ParsedDoc]
     server: Server
     commit: str
-    changed: bool
 
 
 class OwnerCache:
@@ -184,7 +182,6 @@ class OwnerCache:
             docs=docs,
             server=build_server(docs),
             commit=head_commit(checkout),
-            changed=True,
         )
 
     def _pull_blocking(self) -> _PullOutcome:
@@ -201,9 +198,9 @@ class OwnerCache:
         after = head_commit(checkout)
         if after == before and self.server is not None:
             # Unchanged tree: reuse the built docs/server, skip load+build cost.
-            return _PullOutcome(checkout, self.docs, self.server, after, changed=False)
+            return _PullOutcome(checkout, self.docs, self.server, after)
         docs = self._scan_docs(checkout)
-        return _PullOutcome(checkout, docs, build_server(docs), after, changed=True)
+        return _PullOutcome(checkout, docs, build_server(docs), after)
 
     def _scan_docs(self, checkout: Path) -> list[ParsedDoc]:
         """Reuse the stdio ``load_docs`` verbatim against the owner's checkout."""
