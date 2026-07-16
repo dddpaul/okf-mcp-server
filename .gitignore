@@ -20,6 +20,13 @@ dist/
 # Gateway secrets (real tokens); the committed template is .env.example
 .env
 
+# Private/corporate CA material: each deployer drops their own into certs/; the
+# reusable image never ships one organization's CA. Only the placeholder and its
+# README are tracked (see certs/README.md).
+certs/*.crt
+certs/*.pem
+!certs/.gitkeep
+
 # Claude Code (ignore local overrides, track project config)
 .claude/*
 !.claude/settings.json

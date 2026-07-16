@@ -29,6 +29,17 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev
 
+# Private/corporate CA trust (extension point). PEM *.crt files dropped into
+# certs/ (gitignored; empty by default) are installed into the system trust
+# store, so the gateway can clone from git hosts behind a private CA (e.g.
+# Bitbucket Data Center). Placed after the dependency layers so editing certs
+# does not invalidate the uv sync cache. The find strips .gitkeep/README.md so
+# only real CAs land in the trust dir; an empty certs/ is a no-op and the image
+# is unchanged for public hosts.
+COPY certs/ /usr/local/share/ca-certificates/okf-extra/
+RUN find /usr/local/share/ca-certificates/okf-extra/ -type f ! -name '*.crt' -delete \
+ && update-ca-certificates
+
 # Run unprivileged; own /app and the checkout cache so the named volume (which
 # inherits this mountpoint's ownership on first creation) stays writable.
 RUN useradd --create-home --uid 10001 gateway \

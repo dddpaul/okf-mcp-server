@@ -27,6 +27,7 @@ COMPOSE = REPO_ROOT / "docker-compose.yml"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 SERVERS = REPO_ROOT / "servers.yaml"
 GITIGNORE = REPO_ROOT / ".gitignore"
+CERTS_DIR = REPO_ROOT / "certs"
 
 
 def _compose() -> dict[str, Any]:
@@ -141,6 +142,38 @@ def test_gitignore_excludes_dotenv_but_tracks_example() -> None:
     assert ".env" in lines, "real .env must be gitignored"
     assert ".env.example" not in lines, ".env.example must stay tracked"
     assert ENV_EXAMPLE.exists()
+
+
+def test_dockerfile_installs_extra_ca_certs() -> None:
+    """The image bakes the certs/ drop-in into the system trust store.
+
+    The gateway clones over HTTPS via git, which trusts the OpenSSL system
+    bundle; installing certs/ there is what lets it reach a private-CA host
+    (e.g. Bitbucket DC). This asserts the wiring exists offline — the actual
+    trust effect is only observable in a real build (manual step).
+    """
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert "COPY certs/" in text, text
+    assert "/usr/local/share/ca-certificates/" in text, text
+    assert "update-ca-certificates" in text, text
+
+
+def test_certs_placeholder_tracked() -> None:
+    """certs/.gitkeep keeps the dir in the build context so COPY certs/ resolves
+    even when no CA is present (the empty-is-a-no-op contract)."""
+    assert (CERTS_DIR / ".gitkeep").exists(), "certs/.gitkeep must be tracked"
+    assert (CERTS_DIR / "README.md").exists(), (
+        "certs/README.md must document the contract"
+    )
+
+
+def test_gitignore_excludes_cert_material_but_tracks_placeholder() -> None:
+    """Real CA material stays out of the reusable repo; only the placeholder is
+    tracked so the published image ships no organization's CA."""
+    lines = {ln.strip() for ln in GITIGNORE.read_text(encoding="utf-8").splitlines()}
+    assert "certs/*.crt" in lines, "corporate .crt material must be gitignored"
+    assert "certs/*.pem" in lines, "corporate .pem material must be gitignored"
+    assert "!certs/.gitkeep" in lines, "certs/.gitkeep must stay tracked"
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="docker not installed")
