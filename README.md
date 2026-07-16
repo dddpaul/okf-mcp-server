@@ -164,6 +164,28 @@ Secrets live in `.env` (copy it from [`.env.example`](.env.example):
 | `OKF_GATEWAY_HOST` | no | `0.0.0.0` | Bind host. |
 | `OKF_GATEWAY_PORT` | no | `8080` | Bind port. |
 
+### Private CA trust
+
+Owners hosted behind a **private CA** — e.g. a Bitbucket Data Center server
+whose HTTPS certificate is signed by a corporate root — fail to clone with
+`self-signed certificate in certificate chain`, because that root is absent from
+public trust stores. The image provides a build-time drop-in for this: any
+PEM-encoded `*.crt` placed in [`certs/`](certs/) is baked into the system trust
+bundle (via `update-ca-certificates`), which git uses for HTTPS clones.
+
+```sh
+# capture the corporate root (last cert in the presented chain) into the context
+openssl s_client -connect git.example.invalid:443 -showcerts </dev/null 2>/dev/null \
+  | openssl x509 -outform pem > certs/example-root.crt
+docker build -t okf-mcp-gateway .      # the CA is now trusted inside the image
+```
+
+`certs/` is **empty by default** (only `.gitkeep`), so a stock build trusts
+exactly the public CAs — public-host deployments need do nothing. Real cert
+material is gitignored: the reusable image never ships one organization's CA;
+each deployer drops their own. See [`certs/README.md`](certs/README.md) for the
+full contract (`.crt`/PEM requirement, capturing a chain, verifying it).
+
 ### Run it with Docker
 
 Docker is the cross-platform keep-alive (`restart: unless-stopped`) — no
