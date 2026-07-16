@@ -31,4 +31,6 @@ Provide a reusable build-time extension point so the gateway can clone from git 
 Implemented: certs/ drop-in (.gitkeep + README contract), Dockerfile COPY certs/ -> /usr/local/share/ca-certificates/okf-extra/ + update-ca-certificates (strips non-.crt; placed after uv sync so cert edits don't bust dep layers), .gitignore excludes certs/*.crt|*.pem but keeps .gitkeep, 3 offline tests, README Private CA trust section. Offline gate: 146 pytest pass (incl 3 new); ruff check+format clean. Pre-existing test_docker_compose_config_validates fails identically on master (env lacks docker compose v2 plugin) — unrelated. Live docker build is the documented manual network step; base-image pull stalls on cred-helper here. Verified corp chain: leaf git.moscow.alfaintra.net -> Alfa-Bank Sub2 CA 2012 -> self-signed Alfa-Bank Root CA 2012 (root staged gitignored into build context as certs/alfa-root.crt, valid to 2035).
 
 task-reviewer: APPROVED (all 5 AC met, secret hygiene clean, mechanism correct). Merging.
+
+Commit: `587330e` - task-10: Bake private CA certs into gateway image via certs/ drop-in
 <!-- SECTION:NOTES:END -->
