@@ -160,5 +160,6 @@ def test_config_is_gated_by_bearer_token_while_healthz_stays_open(
     assert wrong.status_code == 401
     assert correct.status_code == 200
     assert correct.json()["process"]["auth_required"] is True
+    assert NORTH_TOKEN not in correct.text  # north token itself is never echoed back
     assert health.status_code == 200  # health check stays open with auth enabled
     assert health.text == "ok"
