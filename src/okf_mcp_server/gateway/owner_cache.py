@@ -80,6 +80,9 @@ class OwnerCache:
         server: Currently served MCP server, else ``None`` before the first load.
         commit: ``HEAD`` commit SHA currently served, else ``None`` before load.
         last_pulled: Clock reading of the most recent successful pull, else ``None``.
+        last_pulled_wall: Wall-clock (epoch seconds) of the most recent successful
+            pull, rendered as ``last_pulled_at`` by ``GET /status``, else ``None``;
+            kept separate from the monotonic ``last_pulled`` so TTL stays jump-immune.
     """
 
     def __init__(
@@ -88,6 +91,7 @@ class OwnerCache:
         dest: Path,
         *,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         credentials: Mapping[str, Credential] | None = None,
         env: Mapping[str, str] | None = None,
     ) -> None:
@@ -98,6 +102,10 @@ class OwnerCache:
             dest: Target checkout directory.
             clock: Monotonic-seconds source for TTL staleness; injectable so
                 tests advance time deterministically. Defaults to ``time.monotonic``.
+            wall_clock: Absolute wall-clock (epoch seconds) source stamped at each
+                pull for display as ``last_pulled_at``; separate from ``clock`` so
+                TTL stays monotonic (jump-immune) while humans get an absolute time.
+                Injectable for deterministic tests. Defaults to ``time.time``.
             credentials: Per-host git credentials from the registry, injected into
                 the clone/fetch URLs per invocation; defaults to none (public repos).
             env: Environment the tokens are read from; defaults to ``os.environ``.
@@ -105,6 +113,7 @@ class OwnerCache:
         self.resolved = resolved
         self.dest = dest
         self._clock = clock
+        self._wall_clock = wall_clock
         self._credentials = credentials or {}
         self._env = env
         self.lock = asyncio.Lock()
@@ -113,6 +122,7 @@ class OwnerCache:
         self.server: Server | None = None
         self.commit: str | None = None
         self.last_pulled: float | None = None
+        self.last_pulled_wall: float | None = None
 
     async def load(self) -> None:
         """Perform the one-time startup clone and initial build (off the loop).
@@ -227,12 +237,13 @@ class OwnerCache:
         return load_docs(config)
 
     def _apply(self, outcome: _PullOutcome) -> None:
-        """Swap in a pull's result on the loop in one step and stamp last_pulled."""
+        """Swap in a pull's result on the loop in one step and stamp both clocks."""
         self.checkout = outcome.checkout
         self.docs = outcome.docs
         self.server = outcome.server
         self.commit = outcome.commit
         self.last_pulled = self._clock()
+        self.last_pulled_wall = self._wall_clock()
 
 
 __all__ = ["OwnerCache", "RefreshResult"]

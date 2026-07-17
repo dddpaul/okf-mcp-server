@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
+import re
 import secrets
 import sys
 import time
@@ -49,6 +51,23 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .owner_cache import OwnerCache
 from .registry import Registry
+
+# Redacts URL userinfo (``user:token@``) so a token embedded in a clone URL cannot
+# survive into a rendered ``/status`` error message. Host and path are kept for
+# debugging; only the ``user:token`` pair is dropped.
+_CRED_IN_URL = re.compile(r"(?P<scheme>https?://)[^/@\s]+@")
+
+
+def _scrub_credentials(text: str) -> str:
+    """Redact ``scheme://user:token@`` userinfo from ``text`` (host/path survive)."""
+    return _CRED_IN_URL.sub(r"\g<scheme>***@", text)
+
+
+def _iso_utc(epoch: float) -> str:
+    """Render epoch ``seconds`` as an ISO 8601 UTC string (``...Z``, whole seconds)."""
+    return datetime.datetime.fromtimestamp(
+        epoch, tz=datetime.timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class OwnerState:
@@ -240,11 +259,78 @@ def _effective_config(
     }
 
 
+def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
+    """Assemble live per-owner runtime state for ``GET /status``.
+
+    A pure read of current in-memory state — it never triggers a pull or any
+    side effect. Each owner's ``state`` is derived from its :class:`OwnerState`:
+    an owner whose clone is still in flight is ``"loading"``; a ready owner with a
+    running session manager is ``"serving"``; a ready owner without one is
+    ``"failed"`` (its ``error`` is rendered with render-time credential scrubbing,
+    so a token-bearing clone exception cannot leak). ``commit``/``docs_loaded``/
+    ``last_pulled_*`` are read straight from the owner's cache, so they are
+    ``null``/``0`` until a successful load populates them. The owner ``url`` is
+    deliberately not echoed — that is config, and omitting it keeps a redaction
+    surface off this endpoint.
+
+    Args:
+        owners: The app's per-owner runtime states, keyed by owner name.
+
+    Returns:
+        A JSON/YAML-serializable mapping with a top-level ``summary`` counts block
+        and an ``owners`` map of per-owner state.
+    """
+    owner_map: dict[str, dict[str, Any]] = {}
+    counts = {"serving": 0, "loading": 0, "failed": 0}
+    for name, state in owners.items():
+        cache = state.cache
+        if not state.ready.is_set():
+            owner_state = "loading"
+        elif state.session_manager is not None:
+            owner_state = "serving"
+        else:
+            owner_state = "failed"
+        counts[owner_state] += 1
+        # Read the two stamps into locals: no await runs before they are used, so
+        # the pair is a consistent snapshot even if a pull applies concurrently.
+        last_pulled = cache.last_pulled
+        last_pulled_wall = cache.last_pulled_wall
+        entry: dict[str, Any] = {
+            "state": owner_state,
+            "ref": cache.resolved.ref,
+            "commit": cache.commit,
+            "docs_loaded": len(cache.docs),
+            "last_pulled_at": (
+                None if last_pulled_wall is None else _iso_utc(last_pulled_wall)
+            ),
+            "last_pulled_age_seconds": (
+                None if last_pulled is None else int(cache._clock() - last_pulled)
+            ),
+        }
+        if owner_state == "failed":
+            error = state.error
+            entry["error"] = {
+                "type": type(error).__name__ if error is not None else "UnknownError",
+                "message": _scrub_credentials(str(error)) if error is not None else "",
+            }
+        owner_map[name] = entry
+    return {
+        "summary": {
+            "total": len(owners),
+            "serving": counts["serving"],
+            "loading": counts["loading"],
+            "failed": counts["failed"],
+        },
+        "owners": owner_map,
+    }
+
+
 def create_app(
     registry: Registry,
     cache_dir: Path,
     *,
     clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
     auth_token: str | None = None,
     servers_path: Path | None = None,
     host: str | None = None,
@@ -258,7 +344,9 @@ def create_app(
     request is TTL-gated and ``POST /{owner}/refresh`` forces a pull. ``GET
     /config`` prints the effective configuration (JSON, or YAML with
     ``?format=yaml``); like every route but ``/healthz`` it sits behind the north
-    token, so it never leaks config to an anonymous caller.
+    token, so it never leaks config to an anonymous caller. ``GET /status`` is its
+    live-runtime sibling: a pure read (never a pull) reporting each owner's state,
+    served in the same JSON/``?format=yaml`` shape and behind the same token.
 
     Args:
         registry: Validated registry; its owners form the allowlist and its
@@ -266,6 +354,9 @@ def create_app(
         cache_dir: Directory under which per-owner checkouts are written.
         clock: Monotonic-seconds source threaded into every owner's TTL cache;
             injectable so tests drive staleness deterministically.
+        wall_clock: Absolute wall-clock (epoch seconds) source threaded into every
+            owner's cache; stamped at each pull and rendered as ``last_pulled_at``
+            by ``GET /status``. Injectable so tests assert an exact timestamp.
         auth_token: Shared north bearer token; when set, every route except
             ``GET /healthz`` requires it. ``None`` (the default) leaves the app
             open, which the console entry point forbids in production.
@@ -286,6 +377,7 @@ def create_app(
             resolved,
             cache_dir / name,
             clock=clock,
+            wall_clock=wall_clock,
             credentials=registry.credentials,
         )
         owners[name] = OwnerState(cache)
@@ -312,6 +404,19 @@ def create_app(
             body = yaml.safe_dump(effective, sort_keys=False)
             return PlainTextResponse(body, media_type="application/yaml")
         return JSONResponse(effective)
+
+    async def status(request: Request) -> Response:
+        fmt = request.query_params.get("format", "json").lower()
+        if fmt not in ("json", "yaml"):
+            return JSONResponse(
+                {"error": f"unsupported format {fmt!r}; use 'json' or 'yaml'"},
+                status_code=400,
+            )
+        payload = _owner_status(owners)
+        if fmt == "yaml":
+            body = yaml.safe_dump(payload, sort_keys=False)
+            return PlainTextResponse(body, media_type="application/yaml")
+        return JSONResponse(payload)
 
     async def refresh(request: Request) -> JSONResponse:
         owner = request.path_params["owner"]
@@ -359,6 +464,7 @@ def create_app(
         routes=[
             Route("/healthz", healthz, methods=["GET"]),
             Route("/config", config, methods=["GET"]),
+            Route("/status", status, methods=["GET"]),
             Route("/{owner}/refresh", refresh, methods=["POST"]),
             Route("/{owner}/mcp", endpoint=_MCPRouter(owners)),
         ],
