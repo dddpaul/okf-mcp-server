@@ -123,6 +123,9 @@ endpoint instead of spawning a stdio process per repo.
 - **Auth.** A single shared **north** bearer token guards every route except
   `GET /healthz`; **south** per-host git tokens are injected into clone/fetch
   URLs only and never persisted to `.git/config`.
+- **Introspectable.** `GET /config` returns the effective configuration (JSON, or
+  `?format=yaml`) from behind the north token — for `credentials` it reports the
+  env-var *names* only, never the resolved secret token values.
 
 ### `servers.yaml`
 
@@ -212,6 +215,27 @@ Health and lifecycle:
 curl -fsS http://localhost:8080/healthz               # -> ok (no auth)
 curl -X POST http://localhost:8080/acme/refresh \
   -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # force a pull
+```
+
+### Inspect the effective config
+
+`GET /config` prints the gateway's **effective** runtime configuration: the
+resolved process settings (`servers_path`, `cache_dir`, `host`, `port`,
+`auth_required`), the `defaults` block, every owner with its `ref`/`ttl` already
+**resolved** against those defaults, and the per-host credential **references**.
+It sits behind the north token like every route except `/healthz`, so an
+anonymous caller cannot read it. Credentials are reported by **name only** — each
+host's `token_env` (the environment-variable name) and `token_user` — so the
+resolved secret token value never appears in the output.
+
+Output is JSON by default; `?format=yaml` returns the same structure as YAML. Any
+other `format` value is a `400`.
+
+```sh
+curl -fsS http://localhost:8080/config \
+  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # JSON (default)
+curl -fsS "http://localhost:8080/config?format=yaml" \
+  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # YAML
 ```
 
 ### Point a consumer at it
