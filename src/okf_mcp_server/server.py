@@ -64,7 +64,10 @@ def extract_id(meta: dict[str, Any], path: Path) -> str:
 
 
 def _iter_markdown_files(root: Path) -> list[Path]:
-    return sorted(p for p in root.rglob("*.md") if p.is_file())
+    # Skip symlinks: a repo-root ``README.md`` aliasing ``backlog/docs/`` (the
+    # single-source pattern GitHub requires) would otherwise be indexed on top
+    # of its canonical target. We parse the real file, not the alias.
+    return sorted(p for p in root.rglob("*.md") if p.is_file() and not p.is_symlink())
 
 
 def _build_doc(owner: str, path: Path) -> ParsedDoc | None:
@@ -93,10 +96,16 @@ def _build_doc(owner: str, path: Path) -> ParsedDoc | None:
 
 def load_docs(config: ServerConfig) -> list[ParsedDoc]:
     docs: list[ParsedDoc] = []
+    # MCP resource URIs must be unique. Dedup by ``ParsedDoc.uri`` (first
+    # occurrence wins) as a structural backstop against any filesystem aliasing
+    # — symlinks, overlapping roots, or a duplicated ``id`` — regardless of how
+    # the same knowledge:// URI is reached twice.
+    seen: set[str] = set()
     for root in config.roots:
         for path in _iter_markdown_files(root):
             doc = _build_doc(config.owner, path)
-            if doc is not None:
+            if doc is not None and doc.uri not in seen:
+                seen.add(doc.uri)
                 docs.append(doc)
     return docs
 

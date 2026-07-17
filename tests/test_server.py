@@ -349,3 +349,41 @@ def test_load_docs_uses_owner_override_in_uri(tmp_path: Path) -> None:
     docs = load_docs(config)
     assert len(docs) == 1
     assert docs[0].uri == "knowledge://stacks/doc/decision-2"
+
+
+def test_load_docs_dedups_symlinked_doc_to_unique_uri(tmp_path: Path) -> None:
+    """Gateway whole-root scan must not list a symlinked doc twice.
+
+    Reproduces the live ``stacks`` scenario: the checkout root holds the
+    canonical ``backlog/docs/doc-1*.md`` plus a repo-root ``README.md`` symlink
+    into it (the single-source pattern GitHub requires). Scanning the whole
+    root — as ``owner_cache`` does with ``roots=(checkout,)`` — reaches both,
+    yet ``resources/list`` must expose exactly one ``knowledge://`` URI.
+    """
+    import os
+
+    import frontmatter
+
+    repo = tmp_path / "repo"
+    canonical = _write(
+        repo / "backlog" / "docs",
+        "doc-1 - Project overview.md",
+        _front(
+            "id: doc-1\ntitle: Project overview\ntype: readme\nexport: true\n",
+            "Project overview body.\n",
+        ),
+    )
+    try:
+        os.symlink(canonical, repo / "README.md")
+    except (OSError, NotImplementedError):  # pragma: no cover - platform guard
+        pytest.skip("filesystem does not support symlinks")
+
+    docs = load_docs(_config("stacks", (repo,)))
+
+    uris = [d.uri for d in docs]
+    assert uris.count("knowledge://stacks/readme/doc-1") == 1
+    assert len(uris) == len(set(uris))  # every URI is unique
+
+    (only,) = [d for d in docs if d.uri == "knowledge://stacks/readme/doc-1"]
+    assert only.content != ""
+    assert only.content == frontmatter.load(canonical).content
