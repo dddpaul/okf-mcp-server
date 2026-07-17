@@ -80,3 +80,30 @@ def test_main_builds_multi_owner_app_from_registry(
     assert len(served) == 1
     assert set(served[0].state.owners) == {"acme"}
     assert served[0].state.auth_required is True  # north bearer auth is wired on
+
+
+def test_main_wires_process_config_onto_app_state(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_bare_repo({"docs/x.md": "# x\n"}, ref="main")
+    servers = tmp_path / "servers.yaml"
+    servers.write_text(f"owners:\n  acme:\n    url: {source.url}\n", encoding="utf-8")
+    served: list[Starlette] = []
+    monkeypatch.setattr(
+        main_module.uvicorn, "run", lambda app, **k: served.append(app)
+    )
+    monkeypatch.setenv("OKF_GATEWAY_TOKEN", "north-secret")
+    monkeypatch.setenv("OKF_GATEWAY_SERVERS", str(servers))
+    monkeypatch.setenv("OKF_GATEWAY_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("OKF_GATEWAY_HOST", "127.0.0.1")
+    monkeypatch.setenv("OKF_GATEWAY_PORT", "9000")
+
+    main_module.main()
+
+    assert len(served) == 1
+    # main() resolves host/port and forwards servers_path so GET /config reports them.
+    assert served[0].state.servers_path == servers
+    assert served[0].state.host == "127.0.0.1"
+    assert served[0].state.port == 9000

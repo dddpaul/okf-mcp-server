@@ -35,13 +35,15 @@ import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 
+import yaml
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
 from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -185,19 +187,78 @@ class BearerAuthMiddleware:
         )
 
 
+def _effective_config(
+    registry: Registry,
+    *,
+    servers_path: Path | None,
+    cache_dir: Path,
+    host: str | None,
+    port: int | None,
+    auth_required: bool,
+) -> dict[str, Any]:
+    """Assemble the gateway's effective runtime configuration for ``GET /config``.
+
+    The result is a JSON/YAML-ready mapping — every value is a ``str``, ``int``,
+    ``bool``, ``None``, or a nested mapping of those. Each owner's ``ref``/``ttl``
+    is resolved against the ``defaults`` block (via :meth:`Registry.resolve`), so
+    an owner that omits them reflects the defaults. The ``credentials`` block
+    exposes only each host's token *environment-variable name* and username; the
+    secret token value is never read from the environment nor emitted.
+
+    Args:
+        registry: The validated registry backing this app.
+        servers_path: Path to the loaded ``servers.yaml`` (``None`` if unset).
+        cache_dir: Directory under which per-owner checkouts are written.
+        host: Bind host reported in the process block (``None`` if unset).
+        port: Bind port reported in the process block (``None`` if unset).
+        auth_required: Whether a north token gates every route but ``/healthz``.
+
+    Returns:
+        The effective configuration as a JSON/YAML-serializable mapping.
+    """
+    owners: dict[str, dict[str, Any]] = {}
+    for name in registry.owners:
+        resolved = registry.resolve(name)
+        if resolved is None:  # unreachable: name comes from registry.owners
+            continue
+        owners[name] = {"url": resolved.url, "ref": resolved.ref, "ttl": resolved.ttl}
+    credentials = {
+        host_name: {"token_env": cred.token_env, "token_user": cred.token_user}
+        for host_name, cred in registry.credentials.items()
+    }
+    return {
+        "process": {
+            "servers_path": None if servers_path is None else str(servers_path),
+            "cache_dir": str(cache_dir),
+            "host": host,
+            "port": port,
+            "auth_required": auth_required,
+        },
+        "defaults": {"ref": registry.defaults.ref, "ttl": registry.defaults.ttl},
+        "owners": owners,
+        "credentials": credentials,
+    }
+
+
 def create_app(
     registry: Registry,
     cache_dir: Path,
     *,
     clock: Callable[[], float] = time.monotonic,
     auth_token: str | None = None,
+    servers_path: Path | None = None,
+    host: str | None = None,
+    port: int | None = None,
 ) -> Starlette:
     """Build the multi-owner gateway app from a validated registry.
 
     Each registered owner is eager-cloned in its own background task for the
     app's lifespan; ``/healthz`` and ready owners serve immediately while any
     in-flight clone resolves lazily on first request. Each ``/{owner}/mcp``
-    request is TTL-gated and ``POST /{owner}/refresh`` forces a pull.
+    request is TTL-gated and ``POST /{owner}/refresh`` forces a pull. ``GET
+    /config`` prints the effective configuration (JSON, or YAML with
+    ``?format=yaml``); like every route but ``/healthz`` it sits behind the north
+    token, so it never leaks config to an anonymous caller.
 
     Args:
         registry: Validated registry; its owners form the allowlist and its
@@ -208,6 +269,10 @@ def create_app(
         auth_token: Shared north bearer token; when set, every route except
             ``GET /healthz`` requires it. ``None`` (the default) leaves the app
             open, which the console entry point forbids in production.
+        servers_path: Path to the loaded ``servers.yaml``, reported by
+            ``GET /config``; ``None`` (the default) renders as null there.
+        host: Bind host reported by ``GET /config``; ``None`` renders as null.
+        port: Bind port reported by ``GET /config``; ``None`` renders as null.
 
     Returns:
         A configured Starlette application.
@@ -227,6 +292,26 @@ def create_app(
 
     async def healthz(request: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
+
+    async def config(request: Request) -> Response:
+        fmt = request.query_params.get("format", "json").lower()
+        if fmt not in ("json", "yaml"):
+            return JSONResponse(
+                {"error": f"unsupported format {fmt!r}; use 'json' or 'yaml'"},
+                status_code=400,
+            )
+        effective = _effective_config(
+            registry,
+            servers_path=servers_path,
+            cache_dir=cache_dir,
+            host=host,
+            port=port,
+            auth_required=bool(auth_token),
+        )
+        if fmt == "yaml":
+            body = yaml.safe_dump(effective, sort_keys=False)
+            return PlainTextResponse(body, media_type="application/yaml")
+        return JSONResponse(effective)
 
     async def refresh(request: Request) -> JSONResponse:
         owner = request.path_params["owner"]
@@ -273,15 +358,19 @@ def create_app(
     app = Starlette(
         routes=[
             Route("/healthz", healthz, methods=["GET"]),
+            Route("/config", config, methods=["GET"]),
             Route("/{owner}/refresh", refresh, methods=["POST"]),
             Route("/{owner}/mcp", endpoint=_MCPRouter(owners)),
         ],
         middleware=middleware,
         lifespan=lifespan,
     )
-    # Surface per-owner state and auth posture for tests/introspection.
+    # Surface per-owner state, auth posture, and process config for introspection.
     app.state.owners = owners
     app.state.auth_required = bool(auth_token)
+    app.state.servers_path = servers_path
+    app.state.host = host
+    app.state.port = port
     return app
 
 
