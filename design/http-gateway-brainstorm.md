@@ -162,3 +162,168 @@ server, Docker-supervised.
 - Tests: registry parse/validate, credential resolution, TTL logic, `GitSource`
   against a `file://` bare-repo fixture, Starlette `TestClient` (401/404/list/read/refresh/healthz).
 - README: gateway section (deploy, `servers.yaml`, env vars, consumer `.mcp.json`).
+
+---
+
+## Addendum: GET /status live-runtime endpoint (added 2026-07-17)
+
+### Why
+The gateway now ships `GET /config` (TASK-11), which prints the *effective
+configuration* — the static picture of what the gateway is set up to serve. It
+says nothing about what each owner is *doing right now*: is a clone still in
+flight, is an owner serving, did one fail, how stale is its content? Ops needs a
+single-curl live view to answer "what's each owner doing right now" during
+debugging. All of this state already lives in `OwnerState`/`OwnerCache`; the
+endpoint is almost entirely an additive read.
+
+### What changed
+Add a global, bearer-gated, read-only `GET /status` endpoint, a sibling of
+`/config` (always 200, rich detail, human/ops audience). It is a **pure read**:
+it reports current in-memory state and never triggers a TTL pull or any side
+effect.
+
+**Response shape** (default JSON; `?format=yaml` switches to YAML exactly like
+`/config`; an unsupported `?format=` value → 400):
+
+```json
+{
+  "summary": { "total": 3, "serving": 2, "loading": 0, "failed": 1 },
+  "owners": {
+    "acme": {
+      "state": "serving",
+      "ref": "main",
+      "commit": "1a2b3c4d…",
+      "docs_loaded": 42,
+      "last_pulled_at": "2026-07-17T07:46:46Z",
+      "last_pulled_age_seconds": 340
+    },
+    "beta": {
+      "state": "failed",
+      "ref": "release",
+      "commit": null,
+      "docs_loaded": 0,
+      "last_pulled_at": null,
+      "last_pulled_age_seconds": null,
+      "error": { "type": "CloneError", "message": "fatal: repository not found (bitbucket.corp)" }
+    }
+  }
+}
+```
+
+**Per-owner `state`** is derived from the existing `OwnerState` — no new flags:
+`ready` unset → `"loading"`; `ready` set + `session_manager` present →
+`"serving"`; `ready` set + `session_manager` is `None` → `"failed"` (with
+`error` populated). The `error` key is present **only** for `failed`. `url` is
+deliberately **not** echoed (that's config, and it keeps a redaction surface off
+this endpoint). `commit`/`docs_loaded`/`last_pulled_*` are `null`/`0` while
+`loading` — the honest representation of an owner with no content yet.
+
+**Two-clock addition to `OwnerCache`** (the only change outside `app.py`,
+purely additive so US-003 TTL tests stay green): keep the existing injectable
+`clock` **monotonic** for TTL correctness (immune to wall-clock/NTP jumps), and
+add a second injectable `wall_clock: Callable[[], float] = time.time` plus a
+`last_pulled_wall: float | None` field, stamped in `_apply` alongside the
+existing `last_pulled`. `/status` renders `last_pulled_at` (ISO 8601 UTC) from
+the wall stamp and `last_pulled_age_seconds` from `int(cache._clock() -
+cache.last_pulled)` — same monotonic source as TTL, so age is consistent.
+
+**Security — render-time credential scrub (Option A).** The south git auth
+injects the token into the clone URL (`https://x-token-auth:<TOKEN>@host/…`), so
+a clone-failure exception can carry the token. A small pure helper
+`_scrub_credentials(text)` in `app.py` redacts URL userinfo
+(`(?P<scheme>https?://)[^/@\s]+@` → `\g<scheme>***@`) — host/path survive for
+debugging, the `user:token` pair is gone. Applied only to the failed-owner
+`error.message`; `type(err).__name__` passes through raw. The scrub lives only
+on the status render path (not exported); a future endpoint surfacing
+`state.error` must re-apply it.
+
+### Implementation checklist
+- `owner_cache.py`: add `wall_clock` param (default `time.time`), add
+  `last_pulled_wall: float | None = None` field, stamp it in `_apply` — three
+  additive spots, no behavior change.
+- `app.py`: add `_owner_status(owners)` helper (sibling of `_effective_config`)
+  building the `summary` + `owners` maps; add `_scrub_credentials(text)` helper;
+  add an async `status` route reusing the `/config` `?format=` + 400 handling;
+  register `Route("/status", status, methods=["GET"])` right after `/config`.
+- `README.md`: document `GET /status`, the state enum, the fields, and
+  `?format=`, next to the `/config` docs.
+- `tests/test_gateway_status.py`: TestClient + `file://` bare-repo fixtures —
+  happy path (serving, fixed wall clock → exact ISO, advanced monotonic clock →
+  exact `age_seconds`, summary counts); failed owner (state/error/nulls +
+  token-never-leaks guard in JSON and YAML); loading state returns immediately
+  without blocking; `?format=yaml` round-trip; `?format=xml` → 400; bearer
+  401/200; `/healthz` stays open.
+- Confirm the existing 82 stdio tests and all gateway tests stay green.
+
+### Distilled for ralph-task
+
+**Direction:** Option A — add a global, bearer-gated, read-only `GET /status`
+endpoint (JSON default, `?format=yaml`), rendering live per-owner runtime state
+with render-time credential scrubbing; minimal and additive, mirroring `/config`.
+
+**Locked decisions (with rationale):**
+- **Global `GET /status`, one call lists all owners.** *Rationale:* the audience
+  is ops wanting an at-a-glance view of every owner at once.
+- **Human/ops audience — always 200, rich detail, behind the north bearer token
+  (not `/healthz`-open).** *Rationale:* it's a debugging view, not a machine
+  health probe; the middleware already gates every route but `/healthz`.
+- **Pure read — never triggers a pull or any side effect.** *Rationale:* status
+  observes current state; refreshing is `/{owner}/refresh`'s job.
+- **State enum derived from existing `OwnerState`** (`loading`/`serving`/
+  `failed`). *Rationale:* no new flags; the readiness/session_manager/error
+  fields already encode it.
+- **Two clocks in `OwnerCache`: monotonic for TTL, new injectable wall clock for
+  display.** *Rationale:* TTL must stay monotonic (jump-immune); humans need an
+  absolute timestamp; both injectable keeps tests deterministic.
+- **Report both `last_pulled_at` (ISO 8601 UTC) and `last_pulled_age_seconds`.**
+  *Rationale:* timestamp for humans, age for quick "is it stale" scanning.
+- **Render-time credential scrub (Option A), applied only to the failed-owner
+  error message.** *Rationale:* a clone-failure exception can embed the south
+  git token in the URL; scrubbing at render keeps the change minimal and off the
+  already-reviewed `git_source`.
+- **Include a top-level `summary` counts block.** *Rationale:* at-a-glance totals
+  are the point of a global status view.
+- **Match `/config` format handling** (`?format=` query param, YAML via
+  `application/yaml`, unsupported value → 400). *Rationale:* one consistent
+  surface across the two introspection endpoints.
+
+**Scope cuts:**
+- No per-owner `GET /{owner}/status` route (global only).
+- No machine-monitoring semantics — status is always 200, never reflects health
+  in the HTTP status code; `/healthz` remains the liveness probe.
+- Do **not** echo owner `url` in the status body.
+- No source-level (git_source) scrubbing — render-time only (Option A, not B/C).
+- No change to TTL/refresh behavior; `owner_cache.py` edits are additive only.
+
+**Acceptance criteria (sketch):**
+- `GET /status` returns 200 JSON with top-level `summary` and `owners`; each
+  owner shows `state`, `ref`, `commit`, `docs_loaded`, `last_pulled_at`,
+  `last_pulled_age_seconds`.
+- `summary` reports `total`/`serving`/`loading`/`failed` matching the owners map.
+- A serving owner shows `state:"serving"`, non-null `commit`, `docs_loaded`
+  matching its fixture, an ISO `last_pulled_at`, and an integer
+  `last_pulled_age_seconds`; with a fixed wall clock the ISO string is exact and
+  advancing the monotonic clock by N yields `last_pulled_age_seconds == N`.
+- A failed owner shows `state:"failed"`, an `error` object with `type` and a
+  scrubbed `message`, and null `commit`/`last_pulled_*`; it is counted in
+  `summary.failed`.
+- When an owner's clone fails with a token-bearing URL in the exception, the
+  token string appears nowhere in the `/status` response (JSON and YAML).
+- A still-cloning owner shows `state:"loading"` and `/status` returns without
+  blocking on its readiness.
+- `GET /status?format=yaml` returns 200 `application/yaml` that `yaml.safe_load`
+  round-trips to the JSON structure; an unsupported `?format=` value → 400.
+- `/status` requires the bearer token (missing/wrong → 401, correct → 200);
+  `GET /healthz` stays open.
+- The existing 82 stdio tests remain green and their files are unchanged; lint
+  (`uv run mypy . && uv run ruff check .`) and `uv run pytest` pass.
+
+**Implementation checklist:**
+- `owner_cache.py`: add injectable `wall_clock` (default `time.time`), add
+  `last_pulled_wall: float | None` field, stamp it in `_apply`.
+- `app.py`: add `_owner_status(owners)` + `_scrub_credentials(text)` helpers;
+  add the `status` route (reusing `/config` `?format=`/400 handling); register
+  `Route("/status", …)` after `/config`.
+- `README.md`: document `GET /status`, the state enum, fields, and `?format=`.
+- `tests/test_gateway_status.py`: happy/failed/loading, token-leak guard,
+  `?format=` round-trip + 400, bearer 401/200, `/healthz` open.

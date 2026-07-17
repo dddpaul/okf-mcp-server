@@ -238,6 +238,55 @@ curl -fsS "http://localhost:8080/config?format=yaml" \
   -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # YAML
 ```
 
+### Inspect live per-owner status
+
+`GET /status` is the live-runtime sibling of `/config`: where `/config` shows the
+static picture, `/status` reports what each owner is **doing right now**. It is a
+**pure read** — it never triggers a pull or any other side effect (refreshing is
+`POST /{owner}/refresh`'s job) — and it always returns `200`; it is a debugging
+view, not a machine health probe (`/healthz` remains the liveness check). Like
+every route except `/healthz`, it sits behind the north token.
+
+The body has a top-level `summary` counts block and an `owners` map. Each owner
+reports a `state` derived from its runtime:
+
+- **`loading`** — the startup clone is still in flight; `commit` is `null`,
+  `docs_loaded` is `0`, and `last_pulled_at`/`last_pulled_age_seconds` are `null`.
+- **`serving`** — cloned and serving; `commit`, `docs_loaded`, an ISO 8601 UTC
+  `last_pulled_at`, and an integer `last_pulled_age_seconds` are all populated.
+- **`failed`** — the clone/build failed; an `error` object (`type`, `message`) is
+  present and the pull fields are `null`. Any credentials embedded in the error
+  message (e.g. a token in a clone URL) are scrubbed before rendering.
+
+The owner `url` is deliberately **not** echoed (that is config). Output is JSON by
+default; `?format=yaml` returns the same structure as YAML, and any other
+`format` value is a `400`.
+
+```json
+{
+  "summary": { "total": 2, "serving": 1, "loading": 0, "failed": 1 },
+  "owners": {
+    "acme": {
+      "state": "serving", "ref": "main", "commit": "1a2b3c4d…",
+      "docs_loaded": 42, "last_pulled_at": "2026-07-17T07:46:46Z",
+      "last_pulled_age_seconds": 340
+    },
+    "beta": {
+      "state": "failed", "ref": "release", "commit": null,
+      "docs_loaded": 0, "last_pulled_at": null, "last_pulled_age_seconds": null,
+      "error": { "type": "CloneError", "message": "fatal: repository not found" }
+    }
+  }
+}
+```
+
+```sh
+curl -fsS http://localhost:8080/status \
+  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # JSON (default)
+curl -fsS "http://localhost:8080/status?format=yaml" \
+  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # YAML
+```
+
 ### Point a consumer at it
 
 From a devcontainer or host, reach the gateway at `host.docker.internal` and send
