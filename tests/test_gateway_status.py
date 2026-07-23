@@ -19,7 +19,7 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
-from conftest import FakeClock, GitRepoFixture
+from conftest import FakeClock, GitRepoFixture, push_commit
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
@@ -136,7 +136,7 @@ def test_status_default_json_shape_and_summary(
         assert set(entry) == {
             "state",
             "ref",
-            "commit",
+            "served_commit",
             "docs_loaded",
             "last_pulled_at",
             "last_pulled_age_seconds",
@@ -174,8 +174,8 @@ def test_status_serving_owner_reports_commit_docs_and_injected_clocks(
 
     assert owner["state"] == "serving"
     assert owner["ref"] == "main"
-    assert owner["commit"] is not None
-    int(owner["commit"], 16)  # a hex commit SHA
+    assert owner["served_commit"] is not None
+    int(owner["served_commit"], 16)  # a hex commit SHA
     assert owner["docs_loaded"] == 2
     # Fixed wall clock => exact ISO 8601 UTC timestamp.
     assert owner["last_pulled_at"] == "2026-07-17T07:46:46Z"
@@ -212,7 +212,7 @@ def test_status_failed_owner_is_scrubbed_and_counted(
     beta = body["owners"]["beta"]
     assert beta["state"] == "failed"
     assert beta["ref"] == "release"
-    assert beta["commit"] is None
+    assert beta["served_commit"] is None
     assert beta["docs_loaded"] == 0
     assert beta["last_pulled_at"] is None
     assert beta["last_pulled_age_seconds"] is None
@@ -314,7 +314,7 @@ def test_status_loading_owner_does_not_block(
     assert body["summary"] == {"total": 1, "serving": 0, "loading": 1, "failed": 0}
     slow_entry = body["owners"]["slow"]
     assert slow_entry["state"] == "loading"
-    assert slow_entry["commit"] is None
+    assert slow_entry["served_commit"] is None
     assert slow_entry["docs_loaded"] == 0
     assert slow_entry["last_pulled_at"] is None
     assert slow_entry["last_pulled_age_seconds"] is None
@@ -365,6 +365,81 @@ def test_status_yaml_round_trips_and_unsupported_format_400(
     # YAML carries the same structure as the JSON body (including nulls + error).
     assert yaml.safe_load(yaml_resp.text) == json_resp.json()
     assert bad_resp.status_code == 400  # unsupported ?format= value
+
+
+# A revised ADR body (same id/frontmatter) so a refresh moves the commit and
+# changes ONLY this doc's bytes; the reference doc below stays byte-identical.
+DECISION_DOC_V2 = """---
+export: true
+type: Architecture Decision
+id: st-adr-1
+title: Status ADR
+---
+# Status ADR
+
+The status decision body, revised in a follow-up commit.
+"""
+
+
+def test_status_served_commit_advances_after_refresh_and_stable_hash_holds(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """A refresh onto a new commit advances served_commit (AC#3), yet a doc whose
+    bytes did not change keeps its content_hash while a changed doc gets a new one
+    (AC#4: identical content -> identical hash, enabling no-op-wake detection)."""
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    app = create_app(
+        Registry(owners={"acme": OwnerSpec(url=source.url, ref=source.ref)}),
+        tmp_path / "cache",
+    )
+
+    def hash_of(doc_id: str) -> str:
+        # content_hash is the exact value read_resource/list_resources surface in
+        # each resource's _meta, read straight off the owner's served docs.
+        docs = app.state.owners["acme"].cache.docs
+        return next(d for d in docs if d.id == doc_id).content_hash
+
+    async def scenario() -> dict[str, str]:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as client:
+                await asyncio.wait_for(
+                    app.state.owners["acme"].ready.wait(), timeout=15
+                )
+                before = (await client.get("/status")).json()["owners"]["acme"]
+                captured = {
+                    "commit_before": before["served_commit"],
+                    "ref_hash_before": hash_of("st-ref-1"),
+                    "adr_hash_before": hash_of("st-adr-1"),
+                }
+                # Change ONLY the ADR body; the reference doc's bytes are untouched.
+                captured["pushed_commit"] = push_commit(
+                    source, {"design/adr.md": DECISION_DOC_V2}, message="revise adr"
+                )
+                refresh = await client.post("/acme/refresh")
+                captured["refresh_status"] = str(refresh.status_code)
+                captured["refresh_commit"] = refresh.json()["commit"]
+                after = (await client.get("/status")).json()["owners"]["acme"]
+                captured["commit_after"] = after["served_commit"]
+                captured["ref_hash_after"] = hash_of("st-ref-1")
+                captured["adr_hash_after"] = hash_of("st-adr-1")
+                return captured
+
+    r = asyncio.run(scenario())
+
+    # AC#3: served_commit advanced to exactly the pushed SHA (provenance/liveness).
+    assert r["commit_after"] != r["commit_before"]
+    assert r["commit_after"] == r["pushed_commit"]
+    # /refresh still reports the landed commit under its own 'commit' key.
+    assert r["refresh_status"] == "200"
+    assert r["refresh_commit"] == r["pushed_commit"]
+    # AC#4: the unchanged reference doc keeps its content_hash across the refresh.
+    assert r["ref_hash_after"] == r["ref_hash_before"]
+    # The doc whose bytes changed gets a different content_hash.
+    assert r["adr_hash_after"] != r["adr_hash_before"]
 
 
 def test_status_gated_by_bearer_token_while_healthz_stays_open(

@@ -250,10 +250,10 @@ every route except `/healthz`, it sits behind the north token.
 The body has a top-level `summary` counts block and an `owners` map. Each owner
 reports a `state` derived from its runtime:
 
-- **`loading`** — the startup clone is still in flight; `commit` is `null`,
+- **`loading`** — the startup clone is still in flight; `served_commit` is `null`,
   `docs_loaded` is `0`, and `last_pulled_at`/`last_pulled_age_seconds` are `null`.
-- **`serving`** — cloned and serving; `commit`, `docs_loaded`, an ISO 8601 UTC
-  `last_pulled_at`, and an integer `last_pulled_age_seconds` are all populated.
+- **`serving`** — cloned and serving; `served_commit`, `docs_loaded`, an ISO 8601
+  UTC `last_pulled_at`, and an integer `last_pulled_age_seconds` are all populated.
 - **`failed`** — the clone/build failed; an `error` object (`type`, `message`) is
   present and the pull fields are `null`. Any credentials embedded in the error
   message (e.g. a token in a clone URL) are scrubbed before rendering.
@@ -267,12 +267,12 @@ default; `?format=yaml` returns the same structure as YAML, and any other
   "summary": { "total": 2, "serving": 1, "loading": 0, "failed": 1 },
   "owners": {
     "acme": {
-      "state": "serving", "ref": "main", "commit": "1a2b3c4d…",
+      "state": "serving", "ref": "main", "served_commit": "1a2b3c4d…",
       "docs_loaded": 42, "last_pulled_at": "2026-07-17T07:46:46Z",
       "last_pulled_age_seconds": 340
     },
     "beta": {
-      "state": "failed", "ref": "release", "commit": null,
+      "state": "failed", "ref": "release", "served_commit": null,
       "docs_loaded": 0, "last_pulled_at": null, "last_pulled_age_seconds": null,
       "error": { "type": "CloneError", "message": "fatal: repository not found" }
     }
@@ -286,6 +286,31 @@ curl -fsS http://localhost:8080/status \
 curl -fsS "http://localhost:8080/status?format=yaml" \
   -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # YAML
 ```
+
+#### Freshness signals: `served_commit` vs `content_hash`
+
+The gateway exposes two independent freshness signals that answer **different
+questions**, so a downstream consumer can verify an upstream's canon is actually
+fresh before acting on it:
+
+- **`served_commit`** (owner-level, on `GET /status`) — the git commit SHA of the
+  working copy the gateway currently serves for that owner. It is the
+  **provenance** signal: it answers *"where did this come from?"*. Because it
+  advances after every `POST /{owner}/refresh` that lands a new commit, a consumer
+  can confirm a whole merge→push→pull chain ran (e.g. by checking that a known
+  merge commit is an ancestor of `served_commit`).
+- **`content_hash`** (resource-level, in each MCP resource's `_meta` on both
+  `list_resources` and `read_resource`) — a deterministic `sha256:<hex>` digest
+  over the served bytes of one exported resource. It is the **content identity**
+  signal: it answers *"is this the artifact I need?"*. Byte-identical content
+  always yields the same hash regardless of which commit produced it, so a
+  consumer can detect a **no-op wake** (the owner's commit moved, but the specific
+  artifact it depends on is unchanged → skip re-running) and pin content-addressed
+  dependencies.
+
+In short: `served_commit` is *where did this come from*, `content_hash` is *is
+this the artifact I need*. The gateway only **exposes** these two signals; the
+ancestor check and any cross-project dependency logic live in the consumer.
 
 ### Point a consumer at it
 

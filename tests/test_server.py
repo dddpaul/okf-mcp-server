@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -324,6 +325,71 @@ def test_build_server_read_resource_unknown_uri_raises() -> None:
             mcp_types.ReadResourceRequest,
             mcp_types.ReadResourceRequestParams(uri=uri),
         )
+
+
+def test_content_hash_is_deterministic_sha256_over_served_content() -> None:
+    body = "IDENTICAL BODY BYTES"
+    doc = ParsedDoc(
+        owner="stacks",
+        type="Reference Doc",
+        type_slug="reference-doc",
+        id="a",
+        title="ta",
+        description="da",
+        content=body,
+    )
+    # Two docs with byte-identical content but otherwise different metadata hash
+    # identically: the hash is a pure content identity (not resource identity),
+    # which is exactly what no-op-wake detection needs.
+    twin = ParsedDoc(
+        owner="other",
+        type="Architecture Decision",
+        type_slug="architecture-decision",
+        id="b",
+        title="tb",
+        description="db",
+        content=body,
+    )
+    changed = ParsedDoc(
+        owner="stacks",
+        type="Reference Doc",
+        type_slug="reference-doc",
+        id="a",
+        title="ta",
+        description="da",
+        content=body + " CHANGED",
+    )
+    expected = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert doc.content_hash == expected
+    assert doc.content_hash == twin.content_hash  # identical content -> same hash
+    assert doc.content_hash != changed.content_hash  # changed bytes -> new hash
+
+
+def test_list_resources_exposes_content_hash_in_meta() -> None:
+    docs = _docs_sample()
+    server = build_server(docs)
+    result = _call_handler(server, mcp_types.ListResourcesRequest, None)
+    by_uri = {str(r.uri): r for r in result.root.resources}
+    for d in docs:
+        meta = by_uri[d.uri].meta
+        assert meta is not None
+        assert meta["content_hash"] == d.content_hash
+        assert meta["content_hash"].startswith("sha256:")
+
+
+def test_read_resource_exposes_content_hash_matching_list_and_keeps_body() -> None:
+    docs = _docs_sample()
+    server = build_server(docs)
+    target = docs[1]  # decision-2, content "BODY-DEC-2"
+    result = _call_handler(
+        server,
+        mcp_types.ReadResourceRequest,
+        mcp_types.ReadResourceRequestParams(uri=AnyUrl(target.uri)),
+    )
+    content = result.root.contents[0]
+    assert content.text == target.content  # served body is unchanged
+    assert content.meta is not None
+    assert content.meta["content_hash"] == target.content_hash
 
 
 def test_run_exported() -> None:

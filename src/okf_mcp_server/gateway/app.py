@@ -267,11 +267,13 @@ def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
     an owner whose clone is still in flight is ``"loading"``; a ready owner with a
     running session manager is ``"serving"``; a ready owner without one is
     ``"failed"`` (its ``error`` is rendered with render-time credential scrubbing,
-    so a token-bearing clone exception cannot leak). ``commit``/``docs_loaded``/
-    ``last_pulled_*`` are read straight from the owner's cache, so they are
-    ``null``/``0`` until a successful load populates them. The owner ``url`` is
-    deliberately not echoed — that is config, and omitting it keeps a redaction
-    surface off this endpoint.
+    so a token-bearing clone exception cannot leak). ``served_commit`` is the git
+    SHA of the working copy the gateway currently serves for the owner — the
+    provenance signal a downstream consumer checks to confirm a merge→push→pull
+    chain ran. It, along with ``docs_loaded``/``last_pulled_*``, is read straight
+    from the owner's cache, so they are ``null``/``0`` until a successful load
+    populates them. The owner ``url`` is deliberately not echoed — that is config,
+    and omitting it keeps a redaction surface off this endpoint.
 
     Args:
         owners: The app's per-owner runtime states, keyed by owner name.
@@ -298,7 +300,7 @@ def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
         entry: dict[str, Any] = {
             "state": owner_state,
             "ref": cache.resolved.ref,
-            "commit": cache.commit,
+            "served_commit": cache.commit,
             "docs_loaded": len(cache.docs),
             "last_pulled_at": (
                 None if last_pulled_wall is None else _iso_utc(last_pulled_wall)
