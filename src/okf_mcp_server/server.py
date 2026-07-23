@@ -8,7 +8,9 @@ held by the stable ``id``, not by the slug.
 
 from __future__ import annotations
 
+import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,7 @@ from urllib.parse import urlparse
 import frontmatter
 import mcp.server.stdio
 from mcp.server import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.types import Resource
 
 from .config import ServerConfig
@@ -39,6 +42,22 @@ class ParsedDoc:
     @property
     def uri(self) -> str:
         return f"knowledge://{self.owner}/{self.type_slug}/{self.id}"
+
+    @property
+    def content_hash(self) -> str:
+        """Return a deterministic ``sha256:<hex>`` digest of the served content.
+
+        The hash is taken over exactly the bytes ``read_resource`` returns (the
+        UTF-8-encoded frontmatter body), so it is a stable identity of the served
+        representation: byte-identical content always yields the same hash,
+        regardless of which commit produced it. This lets a downstream consumer
+        detect a no-op wake — the owner's commit moved, but this specific
+        artifact is unchanged — independently of the owner-level ``served_commit``
+        provenance signal. The ``sha256:`` prefix names the algorithm so the
+        digest is self-describing.
+        """
+        digest = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+        return f"sha256:{digest}"
 
 
 def slugify_type(value: str) -> str:
@@ -115,18 +134,21 @@ def build_server(docs: list[ParsedDoc]) -> Server:
 
     @server.list_resources()
     async def _list() -> list[Resource]:
+        # content_hash rides in each resource's ``_meta`` so a consumer can pin a
+        # content-identity dependency from the listing alone, without a read.
         return [
             Resource(
                 uri=d.uri,  # type: ignore[arg-type]
                 name=d.title,
                 description=d.description,
                 mimeType="text/markdown",
+                _meta={"content_hash": d.content_hash},
             )
             for d in docs
         ]
 
     @server.read_resource()
-    async def _read(uri: Any) -> str:
+    async def _read(uri: Any) -> Iterable[ReadResourceContents]:
         parsed = urlparse(str(uri))
         parts = parsed.path.strip("/").split("/", 1)
         if parsed.scheme != "knowledge" or len(parts) != 2:
@@ -134,7 +156,16 @@ def build_server(docs: list[ParsedDoc]) -> Server:
         type_slug, doc_id = parts
         for d in docs:
             if d.type_slug == type_slug and d.id == doc_id:
-                return d.content
+                # Return ReadResourceContents (not a bare str) so content_hash
+                # travels in the result's ``_meta`` and the served bytes carry
+                # their own content-identity signal.
+                return [
+                    ReadResourceContents(
+                        content=d.content,
+                        mime_type="text/markdown",
+                        meta={"content_hash": d.content_hash},
+                    )
+                ]
         raise ValueError(f"unknown resource: {uri}")
 
     return server
