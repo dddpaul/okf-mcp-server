@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "acme-knowledge": {
+      "type": "http",
+      "url": "http://${MCP_GATEWAY_HOST:-localhost}:8080/acme/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_GATEWAY_TOKEN}"
+      }
+    }
+  }
+}

@@ -314,25 +314,29 @@ ancestor check and any cross-project dependency logic live in the consumer.
 
 ### Point a consumer at it
 
-From a devcontainer or host, reach the gateway at `host.docker.internal` and send
-the north bearer token. A project-level `.mcp.json` entry (Claude Code):
+A project-level `.mcp.json` entry (Claude Code) using the dual-mode gateway host
+resolves both on the host and inside a Ralph devcontainer:
+`${MCP_GATEWAY_HOST:-localhost}` is `localhost` on the host and
+`host.docker.internal` in the container (which forwards `MCP_GATEWAY_HOST`). This
+repo ships exactly this entry as `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "acme-knowledge": {
       "type": "http",
-      "url": "http://host.docker.internal:8080/acme/mcp",
+      "url": "http://${MCP_GATEWAY_HOST:-localhost}:8080/acme/mcp",
       "headers": {
-        "Authorization": "Bearer ${OKF_GATEWAY_TOKEN}"
+        "Authorization": "Bearer ${MCP_GATEWAY_TOKEN}"
       }
     }
   }
 }
 ```
 
-Swap `acme` for the owner you want and set `OKF_GATEWAY_TOKEN` in the consumer's
-environment to the same shared token the gateway runs with.
+Swap `acme` for the owner you want and export `MCP_GATEWAY_TOKEN` in the
+consumer's environment, set to the same shared token the gateway runs with (its
+`OKF_GATEWAY_TOKEN`).
 
 ## Known limitations
 
