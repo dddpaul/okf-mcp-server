@@ -232,7 +232,9 @@ def test_unset_token_with_healthy_checkout_serves_stale(
 
     # The owner is configured for an authenticated host whose token env is unset:
     # can't-authenticate is treated as source-unavailable when content exists.
-    creds = {"git.corp": Credential(token_env="OKF_TOK_ABSENT", token_user="x-token-auth")}
+    creds = {
+        "git.corp": Credential(token_env="OKF_TOK_ABSENT", token_user="x-token-auth")
+    }
     registry = Registry(
         owners={"acme": OwnerSpec(url="https://git.corp/acme.git", ref="main")},
         credentials=creds,
@@ -252,7 +254,9 @@ def test_unset_token_with_empty_volume_fails(
 ) -> None:
     """AC#4: a missing south token with an empty volume fails (loud first-deploy)."""
     monkeypatch.delenv("OKF_TOK_ABSENT", raising=False)
-    creds = {"git.corp": Credential(token_env="OKF_TOK_ABSENT", token_user="x-token-auth")}
+    creds = {
+        "git.corp": Credential(token_env="OKF_TOK_ABSENT", token_user="x-token-auth")
+    }
     registry = Registry(
         owners={"acme": OwnerSpec(url="https://git.corp/acme.git", ref="main")},
         credentials=creds,
@@ -269,7 +273,7 @@ def test_outage_then_source_restored_self_heals(
     make_bare_repo: Callable[..., GitRepoFixture],
     tmp_path: Path,
 ) -> None:
-    """AC#5: after an outage, the next get_or_refresh flips source_available + advances."""
+    """AC#5: after an outage, get_or_refresh flips source_available and advances."""
     source = make_bare_repo(FIXTURE_FILES, ref="main")
     dest = tmp_path / "acme"
     clock = FakeClock()
@@ -392,7 +396,7 @@ def test_good_checkout_is_never_rmtreed_on_startup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC#8: a good checkout is never discarded on startup (only clone_owner rmtree's)."""
+    """AC#8: startup never discards a good checkout (only clone_owner rmtrees)."""
     source = make_bare_repo(FIXTURE_FILES, ref="main")
     cache_dir = tmp_path / "cache"
     # First run: heal a checkout, then drop a sentinel to prove it is not recreated.
@@ -427,3 +431,78 @@ def test_good_checkout_is_never_rmtreed_on_startup(
     assert sentinel.exists()  # the persisted checkout survived untouched
     assert entry["state"] == "serving"
     assert entry["served_commit"] == good_commit
+
+
+def test_get_or_refresh_during_outage_serves_stale_without_raising(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """A past-TTL get_or_refresh with the source down keeps serving the last-good
+    build instead of raising, and stays stale so the next request re-attempts."""
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    dest = tmp_path / "acme"
+    clock = FakeClock()
+    resolved = ResolvedOwner(owner="acme", url=source.url, ref=source.ref, ttl=60)
+
+    async def scenario() -> tuple[object, str | None, object, object, object]:
+        cache = OwnerCache(resolved, dest, clock=clock)
+        await cache.load()  # source up: fresh clone at C0 (last_pulled stamped at 0)
+        good_server = cache.server
+        good_commit = cache.commit
+        shutil.rmtree(source.bare_dir)  # source goes down
+        clock.advance(100)  # past ttl=60 -> the request attempts a pull
+        served1 = await cache.get_or_refresh(60)  # must NOT raise
+        after1 = (cache.source_available, cache.commit, cache.last_pulled)
+        clock.advance(100)  # still stale: the failed attempt left last_pulled frozen
+        served2 = await cache.get_or_refresh(60)  # re-attempts, still serves
+        return good_server, good_commit, served1, served2, after1
+
+    good_server, good_commit, served1, served2, after1 = asyncio.run(scenario())
+
+    assert served1 is good_server  # same last-good build, no rebuild, no raise
+    assert served2 is good_server  # every stale request keeps serving it
+    # Stale flag set; the success clock stayed frozen at the load stamp (t=0), so
+    # the owner remains past-TTL and re-attempts on the next request.
+    assert after1 == (False, good_commit, 0.0)
+
+
+def test_refresh_502_error_is_scrubbed_of_tokens(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC#6/#7: a token embedded in the source error is scrubbed from the 502 body."""
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    leaky_url = f"https://x-token-auth:{GIT_TOKEN_SECRET}@git.corp/acme.git"
+
+    def leaky_fetch(
+        checkout: Path,
+        ref: str,
+        url: str,
+        *,
+        credentials: Mapping[str, Credential] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
+        raise subprocess.CalledProcessError(128, ["git", "fetch", leaky_url, ref])
+
+    app = create_app(_registry(source), tmp_path / "cache")
+
+    async def scenario() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as client:
+                await asyncio.wait_for(
+                    app.state.owners["acme"].ready.wait(), timeout=15
+                )
+                # The initial clone is done; make the forced fetch fail with a token.
+                monkeypatch.setattr(owner_cache_module, "fetch_and_reset", leaky_fetch)
+                return await client.post("/acme/refresh")
+
+    refresh = asyncio.run(scenario())
+
+    assert refresh.status_code == 502
+    body = refresh.json()
+    assert GIT_TOKEN_SECRET not in body["error"]  # the token never reaches the body
+    assert "***@git.corp" in body["error"]  # userinfo redacted, host kept for debugging

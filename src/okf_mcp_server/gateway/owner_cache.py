@@ -39,7 +39,7 @@ _SOURCE_UNAVAILABLE = (CalledProcessError, CredentialError)
 
 
 class RefreshUnavailable(RuntimeError):
-    """Raised by :meth:`OwnerCache.force_refresh` when a pull fails but serving continues.
+    """Raised by :meth:`force_refresh` when a pull fails but the owner keeps serving.
 
     An explicit ``POST /{owner}/refresh`` must report a source outage loudly (so a
     ``curl --fail`` script trips) even though the owner keeps serving its last-good
