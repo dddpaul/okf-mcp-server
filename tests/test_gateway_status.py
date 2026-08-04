@@ -132,16 +132,26 @@ def test_status_default_json_shape_and_summary(
     assert body["summary"] == {"total": 2, "serving": 2, "loading": 0, "failed": 0}
     assert set(body["owners"]) == {"acme", "beta"}
     for entry in body["owners"].values():
-        # A serving owner carries exactly the six base keys (no error object).
+        # A serving owner carries exactly the base keys (no error object). The
+        # offline-fallback fields are always present; a healthy owner reports the
+        # source as available and not stale.
         assert set(entry) == {
             "state",
             "ref",
             "served_commit",
+            "source_available",
+            "stale",
             "docs_loaded",
             "last_pulled_at",
             "last_pulled_age_seconds",
+            "last_pull_attempt_at",
+            "last_pull_error",
         }
         assert entry["state"] == "serving"
+        assert entry["source_available"] is True
+        assert entry["stale"] is False
+        assert entry["last_pull_error"] is None
+        assert entry["last_pull_attempt_at"] is not None  # stamped on the load pull
 
 
 def test_status_serving_owner_reports_commit_docs_and_injected_clocks(

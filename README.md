@@ -120,6 +120,13 @@ endpoint instead of spawning a stdio process per repo.
   `servers.yaml` registry *is* the allowlist — an unregistered owner gets 404.
 - **Fresh enough.** Each request pulls the owner if it is staler than its TTL
   (default 60s); `POST /{owner}/refresh` forces an immediate pull.
+- **Offline fallback.** The cache volume is authoritative last-good content: when
+  an owner already has a healthy checkout and the git source is unreachable (or its
+  south token is unset), the gateway serves that **stale-but-good** checkout instead
+  of failing empty — at startup and at TTL refresh alike. A good checkout is never
+  discarded; only an absent or corrupt one is re-cloned. `GET /status` flags the
+  fallback (`source_available:false`, `stale:true`); `POST /{owner}/refresh` returns
+  `502` while the owner keeps serving.
 - **Auth.** A single shared **north** bearer token guards every route except
   `GET /healthz`; **south** per-host git tokens are injected into clone/fetch
   URLs only and never persisted to `.git/config`.
@@ -214,7 +221,7 @@ Health and lifecycle:
 ```sh
 curl -fsS http://localhost:8080/healthz               # -> ok (no auth)
 curl -X POST http://localhost:8080/acme/refresh \
-  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # force a pull
+  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # force a pull (502 if source down)
 ```
 
 ### Inspect the effective config
@@ -254,9 +261,28 @@ reports a `state` derived from its runtime:
   `docs_loaded` is `0`, and `last_pulled_at`/`last_pulled_age_seconds` are `null`.
 - **`serving`** — cloned and serving; `served_commit`, `docs_loaded`, an ISO 8601
   UTC `last_pulled_at`, and an integer `last_pulled_age_seconds` are all populated.
+  A `serving` owner may be serving a **stale offline fallback** — see the fields
+  below.
 - **`failed`** — the clone/build failed; an `error` object (`type`, `message`) is
   present and the pull fields are `null`. Any credentials embedded in the error
   message (e.g. a token in a clone URL) are scrubbed before rendering.
+
+Every owner also carries the four **offline-fallback** fields, so a stale
+last-good serve is never silent:
+
+- **`source_available`** — whether the most recent git attempt (clone/fetch)
+  succeeded. `false` means the owner is serving a **stale offline fallback**: the
+  source was unreachable (or its south token unset) and the gateway kept serving
+  the last-good checkout rather than failing.
+- **`stale`** — derived (`source_available` is `false` with content on hand); the
+  quick "am I serving old docs?" flag. A `serving` owner with `stale:true` still
+  answers MCP requests — from its persisted checkout, not a fresh pull.
+- **`last_pull_attempt_at`** — ISO 8601 UTC of the last pull *attempt* (success or
+  failure), distinct from `last_pulled_at` (the age of the served *content*), so
+  "serving old docs, still retrying every request" is distinguishable from
+  "haven't retried since boot".
+- **`last_pull_error`** — the scrubbed error from the last failed attempt (`null`
+  after a success); like the `failed` `error`, any token in a URL is redacted.
 
 The owner `url` is deliberately **not** echoed (that is config). Output is JSON by
 default; `?format=yaml` returns the same structure as YAML, and any other
@@ -268,17 +294,27 @@ default; `?format=yaml` returns the same structure as YAML, and any other
   "owners": {
     "acme": {
       "state": "serving", "ref": "main", "served_commit": "1a2b3c4d…",
+      "source_available": true, "stale": false,
       "docs_loaded": 42, "last_pulled_at": "2026-07-17T07:46:46Z",
-      "last_pulled_age_seconds": 340
+      "last_pulled_age_seconds": 340,
+      "last_pull_attempt_at": "2026-07-17T07:46:46Z", "last_pull_error": null
     },
     "beta": {
       "state": "failed", "ref": "release", "served_commit": null,
+      "source_available": false, "stale": false,
       "docs_loaded": 0, "last_pulled_at": null, "last_pulled_age_seconds": null,
+      "last_pull_attempt_at": "2026-07-17T07:41:12Z",
+      "last_pull_error": "fatal: repository not found",
       "error": { "type": "CloneError", "message": "fatal: repository not found" }
     }
   }
 }
 ```
+
+A **stale** owner (source down, healthy checkout) instead looks like `acme` with
+`"state": "serving"`, `"source_available": false`, `"stale": true`, its
+`served_commit` frozen at the pre-outage SHA, `last_pulled_at` unchanged, and a
+fresh `last_pull_attempt_at` on every request until the source returns.
 
 ```sh
 curl -fsS http://localhost:8080/status \
@@ -286,6 +322,29 @@ curl -fsS http://localhost:8080/status \
 curl -fsS "http://localhost:8080/status?format=yaml" \
   -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # YAML
 ```
+
+#### Offline fallback and `POST /{owner}/refresh`
+
+The persisted cache volume is an **authoritative offline fallback**. If an owner
+already has a healthy checkout and the git source is unreachable — or its south
+token is unset — the gateway serves that last-good checkout **stale-but-good**
+instead of failing empty, both at startup and at each TTL refresh. Only an
+**absent or corrupt** checkout with the source down fails the owner; a good
+checkout is never discarded (the integrity gate is `git rev-parse HEAD`). An
+implicit TTL refresh never breaks an MCP request and self-heals on the next
+successful pull, so `GET /{owner}/mcp` keeps serving right through an outage.
+
+An **explicit** `POST /{owner}/refresh`, by contrast, reports the outage loudly:
+it returns **`502 Bad Gateway`** — the upstream git source failed, not the gateway
+(so not `503`) — with a body naming the still-served commit, while the MCP content
+path stays up:
+
+```json
+{ "owner": "acme", "served_commit": "1a2b3c4d…", "source_available": false,
+  "error": "fatal: unable to access …" }
+```
+
+A successful refresh still returns `200` with `{owner, ref, commit, docs_loaded}`.
 
 #### Freshness signals: `served_commit` vs `content_hash`
 

@@ -327,3 +327,166 @@ with render-time credential scrubbing; minimal and additive, mirroring `/config`
 - `README.md`: document `GET /status`, the state enum, fields, and `?format=`.
 - `tests/test_gateway_status.py`: happy/failed/loading, token-leak guard,
   `?format=` round-trip + 400, bearer 401/200, `/healthz` open.
+
+---
+
+## Addendum: offline volume-cache fallback (added 2026-08-04)
+
+### Why
+
+The named Docker volume (`okf-checkouts:/var/cache/okf-mcp-gateway`) already
+persists every owner's checkout across restarts — but the software throws that
+copy away on boot. `OwnerCache.load()` → `clone_owner()` runs
+`shutil.rmtree(dest)` **unconditionally** before the fresh `git clone`
+(`git_source.py:156-157`). So on a restart while the git host is unreachable, the
+gateway *deletes the good persisted checkout first*, then the clone fails, and the
+owner lands in `failed` state serving nothing. The persisted data existed and was
+destroyed before it could help. The fix makes the cache **authoritative fallback
+content**: a source outage must degrade to *stale-but-served*, never to
+*empty-and-failed*.
+
+### What changed
+
+The rule is uniform across both git-touch moments (**startup and refresh**):
+*source unavailable ⇒ serve the last-good checkout; never fail to empty.*
+
+**Startup (`load()`) — synchronous refresh-then-fallback.** Before any
+destructive step, gate on an integrity check (`git -C <dest> rev-parse HEAD`):
+
+| Volume state | Source reachable? | Outcome |
+|---|---|---|
+| Healthy checkout (`rev-parse` ok) | Up | `fetch_and_reset` → serve fresh (`source_available=true`) |
+| Healthy checkout | Down | serve existing checkout as-is (`serving`, `source_available=false`, `stale=true`) |
+| Corrupt (`rev-parse` fails) | Up | rmtree → fresh clone → serve |
+| Corrupt | Down | rmtree → clone fails → `failed` (nothing safe to serve) |
+| Absent (first boot) | Up | fresh clone → serve |
+| Absent | Down | clone fails → `failed` (genuinely nothing to serve) |
+
+A **good checkout is never rmtree'd.** Only the two `Down + servable` rows change
+from today (`failed` → `serving-stale`).
+
+**`CredentialError` (missing south token) is treated as source-unavailable** when
+a good checkout exists — it serves stale rather than failing fast, because "can't
+authenticate to the source" and "can't reach the source" are the same degraded
+state. On an **empty volume** a missing token still fails the owner, so genuine
+first-deploy misconfiguration is still caught loudly on the first boot; and it is
+no longer silent, because `/status` surfaces `source_available:false` +
+`last_pull_error`.
+
+**Refresh path (running-time).** `get_or_refresh(ttl)` catches a failed
+`_pull_blocking()`, stamps the failure fields, and **returns the existing
+`self.server`** instead of raising — a TTL expiry during an outage never turns a
+servable owner into a failing MCP request, and every stale request re-attempts the
+pull, so the owner self-heals the instant the source returns.
+`force_refresh()` (backs `POST /{owner}/refresh`) keeps serving stale but the HTTP
+handler returns **`502 Bad Gateway`** with a scrubbed body naming the error and the
+`served_commit` still being served — an explicit "pull now" reports loudly
+(`curl --fail` trips) while the MCP content path stays up. 502 = "upstream git
+source failed," not 503 (the gateway itself is up).
+
+**Observability (`/status`).** Each owner `entry` in `_owner_status` gains
+`source_available` (last git attempt succeeded?), `stale` (derived:
+`source_available is False and served_commit is not None`), `last_pull_attempt_at`
+(wall-clock of last *attempt*, success or fail), and `last_pull_error` (scrubbed).
+A stale-but-serving owner stays `state:"serving"` (it has a session_manager and
+answers requests) — `source_available:false` is what marks the content as a
+fallback. Splitting `last_pulled_at` (age of served *content*) from
+`last_pull_attempt_at` (age of last *try*) distinguishes "serving old docs, still
+trying every request" from "serving old docs, haven't tried since boot."
+
+### Implementation checklist
+
+- `owner_cache.py`: add fields `source_available: bool`, `last_pull_attempt_at:
+  float | None`, `last_pull_error: str | None` (stamped in `_apply`, which grows
+  `*, source_available, last_pull_error` params and always stamps the attempt time).
+- `owner_cache.py`: add `_valid_checkout_exists(dest)` (wraps `git rev-parse HEAD`)
+  and `_serve_existing()` (the "unchanged tree" branch of `_pull_blocking` reused
+  verbatim: scan docs + build server from current HEAD).
+- `owner_cache.py` `load()`: implement the branch table above — valid checkout →
+  try `_pull_blocking`, on `(CalledProcessError, CredentialError)` fall back to
+  `_serve_existing`; absent/corrupt → rmtree-if-present + `_clone_blocking`.
+- `owner_cache.py` `get_or_refresh()`: on pull failure, stamp fields + return
+  existing `self.server` (no raise); success flips `source_available` back to true.
+- `owner_cache.py` `force_refresh()`: on pull failure, stamp fields, keep serving,
+  and signal the handler to emit 502 (e.g. raise a typed `RefreshUnavailable`
+  carrying `served_commit` + scrubbed error, caught in the route).
+- `app.py` `_owner_status`: add the four fields to each owner `entry`; keep a
+  stale owner as `serving`.
+- `app.py` `/refresh` route: map the source-down signal to a `502` JSON response
+  with `{owner, served_commit, source_available:false, error}`.
+- `README.md`: document offline-fallback behavior, the new `/status` fields, and
+  the `/refresh` 502-on-source-down contract.
+- `tests/test_gateway_*.py`: the 7 offline cases below (file:// bare-repo fixtures
+  + TestClient). Confirm the 82 stdio tests remain untouched and green.
+
+### Distilled for ralph-task
+
+**Direction:** Make the persisted Docker volume checkout an authoritative offline
+fallback — a git-source outage degrades to *stale-but-served*, never
+*empty-and-failed* — uniformly across startup and refresh (chosen: Option B scope +
+Option A synchronous refresh-then-fallback).
+
+**Locked decisions (with rationale):**
+- **Scope = startup + refresh:** one rule everywhere — source-unavailable ⇒ serve
+  last-good. *Rationale:* the outage principle is identical at boot and at TTL
+  refresh; unifying is less code than special-casing startup.
+- **Synchronous refresh-then-fallback:** `load()` tries `fetch_and_reset` on an
+  existing checkout and serves it as-is on git failure; only absent/corrupt goes to
+  a fresh clone. *Rationale:* reuses `fetch_and_reset`/`_pull_blocking` verbatim and
+  keeps the existing synchronous ready-gate — no background-task machinery.
+- **Never rmtree a good checkout:** the destructive rmtree only runs for
+  absent/corrupt checkouts. *Rationale:* the current unconditional rmtree is the
+  root cause of the data loss.
+- **Integrity gate = `git rev-parse HEAD`:** corrupt checkout is discarded and
+  re-cloned. *Rationale:* cheap, decisive signal already used by `head_commit`;
+  corrupt content has no fallback value.
+- **CredentialError + good checkout ⇒ serve stale:** missing south token behaves
+  like a source outage when servable content exists; empty volume still fails.
+  *Rationale:* can't-authenticate ≡ can't-reach; empty-volume path still catches
+  real misconfig loudly, and `/status` makes it non-silent.
+- **get_or_refresh serves stale, /refresh returns 502:** per-request TTL refresh
+  never raises (self-heals on next success); explicit `POST /refresh` returns 502
+  on source-down but keeps serving. *Rationale:* implicit refresh must not break
+  MCP requests; explicit refresh must report loudly for scripts.
+- **Stale owner = `serving`, not `failed`:** `source_available:false` marks the
+  fallback; content path is unchanged. *Rationale:* the owner genuinely answers
+  requests; `failed` is reserved for "nothing to serve."
+
+**Scope cuts:**
+- No async serve-then-refresh / background refresh task (rejected Option B in Q2).
+- No forced "offline mode" config flag / air-gap toggle (rejected Option C in Q1) —
+  fallback is automatic on failure, never operator-forced.
+- No change to the stdio path (`server.py` run()/serve_stdio/cli.py) or its 82
+  tests — this is entirely gateway-side.
+- No new persistence format or volume-layout change — the existing named volume and
+  per-owner checkout dirs are reused as-is.
+
+**Acceptance criteria (sketch):**
+- Restart with a healthy checkout + unreachable `file://` source → owner is
+  `serving`, `source_available=false`, `stale=true`, `served_commit` = pre-outage SHA.
+- Restart with a corrupt checkout (`rm -rf <dest>/.git`) + source-down → owner
+  `failed`; + source-up → re-clones clean and serves.
+- Empty volume + source-down → owner `failed`.
+- Unset south token + healthy checkout → `serving`+`stale`; unset token + empty
+  volume → `failed`.
+- Outage → stale, then restore source → next `get_or_refresh` flips
+  `source_available=true` and advances `served_commit` (self-heal).
+- `POST /{owner}/refresh` with source-down → HTTP 502, body carries
+  `source_available:false` + scrubbed error + still-served `served_commit`; MCP
+  content requests for that owner still succeed.
+- `/status` exposes `source_available`, `stale`, `last_pull_attempt_at`,
+  `last_pull_error` per owner; scrubbed error never contains a token.
+- The 82 stdio tests remain untouched and green; `uv run mypy . && uv run ruff
+  check .` and `uv run pytest` all pass.
+
+**Implementation checklist:**
+- Add the three fields + `_valid_checkout_exists` + `_serve_existing` to
+  `OwnerCache`; grow `_apply` to stamp them.
+- Rewrite `load()` to the branch table (valid→refresh-or-fallback;
+  absent/corrupt→rmtree-if-present + clone).
+- Make `get_or_refresh` non-raising on pull failure (serve existing, stamp fields).
+- Make `force_refresh` signal source-down to the route (typed exception) for the
+  502 mapping; keep serving.
+- Add the four fields to `_owner_status`; keep stale owners as `serving`.
+- Map source-down to `502` in the `/refresh` route.
+- Update `README.md`; add the 7 offline tests to `tests/test_gateway_*.py`.
