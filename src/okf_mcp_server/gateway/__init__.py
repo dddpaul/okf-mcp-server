@@ -12,7 +12,7 @@ from __future__ import annotations
 from .app import BearerAuthMiddleware, create_app
 from .config import GatewayConfig
 from .git_source import CredentialError, build_authenticated_url
-from .owner_cache import OwnerCache, RefreshResult
+from .owner_cache import OwnerCache, RefreshResult, RefreshUnavailable
 from .registry import Registry, RegistryError, load_registry
 
 __all__ = [
@@ -21,6 +21,7 @@ __all__ = [
     "GatewayConfig",
     "OwnerCache",
     "RefreshResult",
+    "RefreshUnavailable",
     "Registry",
     "RegistryError",
     "build_authenticated_url",

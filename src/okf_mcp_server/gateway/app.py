@@ -49,7 +49,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .owner_cache import OwnerCache
+from .owner_cache import OwnerCache, RefreshUnavailable
 from .registry import Registry
 
 # Redacts URL userinfo (``user:token@``) so a token embedded in a clone URL cannot
@@ -267,13 +267,21 @@ def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
     an owner whose clone is still in flight is ``"loading"``; a ready owner with a
     running session manager is ``"serving"``; a ready owner without one is
     ``"failed"`` (its ``error`` is rendered with render-time credential scrubbing,
-    so a token-bearing clone exception cannot leak). ``served_commit`` is the git
-    SHA of the working copy the gateway currently serves for the owner — the
-    provenance signal a downstream consumer checks to confirm a merge→push→pull
-    chain ran. It, along with ``docs_loaded``/``last_pulled_*``, is read straight
-    from the owner's cache, so they are ``null``/``0`` until a successful load
-    populates them. The owner ``url`` is deliberately not echoed — that is config,
-    and omitting it keeps a redaction surface off this endpoint.
+    so a token-bearing clone exception cannot leak). A ``serving`` owner may be
+    serving a stale offline fallback: ``source_available`` is ``false`` when the
+    last git attempt failed, and the derived ``stale`` flag (``source_available``
+    is ``false`` with content on hand) marks that the served content is last-good
+    rather than fresh. ``last_pull_attempt_at`` (wall-clock of the last *attempt*,
+    success or fail) sits alongside ``last_pulled_at`` (age of the served
+    *content*) so "still retrying every request" is distinguishable from "haven't
+    retried since boot", and ``last_pull_error`` carries the scrubbed failure.
+    ``served_commit`` is the git SHA of the working copy the gateway currently
+    serves for the owner — the provenance signal a downstream consumer checks to
+    confirm a merge→push→pull chain ran. It, along with ``docs_loaded``/
+    ``last_pulled_*``, is read straight from the owner's cache, so they are
+    ``null``/``0`` until a successful load populates them. The owner ``url`` is
+    deliberately not echoed — that is config, and omitting it keeps a redaction
+    surface off this endpoint.
 
     Args:
         owners: The app's per-owner runtime states, keyed by owner name.
@@ -293,20 +301,31 @@ def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
         else:
             owner_state = "failed"
         counts[owner_state] += 1
-        # Read the two stamps into locals: no await runs before they are used, so
-        # the pair is a consistent snapshot even if a pull applies concurrently.
+        # Read the stamps into locals: no await runs before they are used, so the
+        # group is a consistent snapshot even if a pull applies concurrently.
         last_pulled = cache.last_pulled
         last_pulled_wall = cache.last_pulled_wall
+        last_pull_attempt_at = cache.last_pull_attempt_at
+        last_pull_error = cache.last_pull_error
         entry: dict[str, Any] = {
             "state": owner_state,
             "ref": cache.resolved.ref,
             "served_commit": cache.commit,
+            "source_available": cache.source_available,
+            # stale = serving last-good content while the source is unreachable.
+            "stale": cache.source_available is False and cache.commit is not None,
             "docs_loaded": len(cache.docs),
             "last_pulled_at": (
                 None if last_pulled_wall is None else _iso_utc(last_pulled_wall)
             ),
             "last_pulled_age_seconds": (
                 None if last_pulled is None else int(cache._clock() - last_pulled)
+            ),
+            "last_pull_attempt_at": (
+                None if last_pull_attempt_at is None else _iso_utc(last_pull_attempt_at)
+            ),
+            "last_pull_error": (
+                None if last_pull_error is None else _scrub_credentials(last_pull_error)
             ),
         }
         if owner_state == "failed":
@@ -432,7 +451,21 @@ def create_app(
             return JSONResponse(
                 {"error": f"owner {owner} is unavailable"}, status_code=503
             )
-        result = await state.cache.force_refresh()
+        try:
+            result = await state.cache.force_refresh()
+        except RefreshUnavailable as exc:
+            # Upstream git source failed, but the owner keeps serving its last-good
+            # checkout — report 502 loudly (a `curl --fail` script trips) while the
+            # MCP content path stays up. 502, not 503: the gateway itself is fine.
+            return JSONResponse(
+                {
+                    "owner": owner,
+                    "served_commit": exc.served_commit,
+                    "source_available": False,
+                    "error": _scrub_credentials(exc.error),
+                },
+                status_code=502,
+            )
         # Point the transport at the rebuilt server for subsequent MCP sessions.
         server = state.cache.server
         assert server is not None  # force_refresh() always leaves a built server

@@ -22,13 +22,39 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from subprocess import CalledProcessError
 
 from mcp.server import Server
 
 from ..config import ServerConfig
 from ..server import ParsedDoc, build_server, load_docs
-from .git_source import clone_owner, fetch_and_reset, head_commit
+from .git_source import CredentialError, clone_owner, fetch_and_reset, head_commit
 from .registry import Credential, ResolvedOwner
+
+# A git-source failure that the offline fallback treats as "source unavailable":
+# a git subprocess non-zero exit (host unreachable, ref gone) or a missing south
+# credential (can't-authenticate is the same degraded state as can't-reach). A
+# healthy checkout degrades to stale-but-served on these; an empty volume fails.
+_SOURCE_UNAVAILABLE = (CalledProcessError, CredentialError)
+
+
+class RefreshUnavailable(RuntimeError):
+    """Raised by :meth:`OwnerCache.force_refresh` when a pull fails but serving continues.
+
+    An explicit ``POST /{owner}/refresh`` must report a source outage loudly (so a
+    ``curl --fail`` script trips) even though the owner keeps serving its last-good
+    checkout. This carries the still-served commit and a token-free error string so
+    the route can answer ``502 Bad Gateway`` without breaking the content path.
+
+    Attributes:
+        served_commit: ``HEAD`` SHA still being served, or ``None`` if never loaded.
+        error: Token-free description of the git-source failure.
+    """
+
+    def __init__(self, *, served_commit: str | None, error: str) -> None:
+        super().__init__(error)
+        self.served_commit = served_commit
+        self.error = error
 
 
 @dataclass(frozen=True)
@@ -83,6 +109,16 @@ class OwnerCache:
         last_pulled_wall: Wall-clock (epoch seconds) of the most recent successful
             pull, rendered as ``last_pulled_at`` by ``GET /status``, else ``None``;
             kept separate from the monotonic ``last_pulled`` so TTL stays jump-immune.
+        source_available: Whether the most recent git attempt (clone/fetch)
+            succeeded; ``False`` marks the served content as a stale offline
+            fallback. Starts ``True`` (optimistic — no attempt has failed yet).
+        last_pull_attempt_at: Wall-clock (epoch seconds) of the most recent pull
+            *attempt*, success or failure, else ``None`` before the first attempt;
+            rendered as ``last_pull_attempt_at`` by ``GET /status``. Distinct from
+            ``last_pulled_wall`` (age of served *content*) so "serving old docs,
+            still retrying" is distinguishable from "haven't retried since boot".
+        last_pull_error: Token-free description of the most recent failed attempt,
+            else ``None`` when the last attempt succeeded (or none has run yet).
     """
 
     def __init__(
@@ -123,16 +159,57 @@ class OwnerCache:
         self.commit: str | None = None
         self.last_pulled: float | None = None
         self.last_pulled_wall: float | None = None
+        self.source_available: bool = True
+        self.last_pull_attempt_at: float | None = None
+        self.last_pull_error: str | None = None
 
     async def load(self) -> None:
-        """Perform the one-time startup clone and initial build (off the loop).
+        """Serve the owner at startup, preferring last-good content over empty failure.
 
-        Runs the shallow clone, doc scan, and server build in a worker thread,
-        then applies the result on the loop. Call exactly once per owner before
-        any :meth:`get_or_refresh` / :meth:`force_refresh`.
+        The persisted volume checkout is an authoritative offline fallback: a
+        source outage degrades to *stale-but-served*, never *empty-and-failed*.
+        The branch table (integrity gate = ``git rev-parse HEAD``; source =
+        clone/fetch):
+
+        =================  =================  =============================
+        Volume state       Source reachable?  Outcome
+        =================  =================  =============================
+        Healthy checkout   up                 fetch+reset, serve fresh
+        Healthy checkout   down               serve existing (stale, no raise)
+        Corrupt            up                 rmtree, fresh clone
+        Corrupt            down               rmtree, clone fails -> failed
+        Absent             up                 fresh clone
+        Absent             down               clone fails -> failed
+        =================  =================  =============================
+
+        A healthy checkout is **never** ``rmtree``'d — only an absent or corrupt
+        one is discarded and re-cloned (``clone_owner`` owns that removal). A
+        source outage (git failure or missing south credential) with a healthy
+        checkout serves the existing checkout as-is; only an empty/corrupt volume
+        with the source down fails the owner. Every git/scan/build step runs in a
+        worker thread; the result is applied on the loop. Call exactly once per
+        owner before any :meth:`get_or_refresh` / :meth:`force_refresh`.
         """
-        outcome = await asyncio.to_thread(self._clone_blocking)
-        self._apply(outcome)
+        if self._valid_checkout_exists(self.dest):
+            # Healthy last-good checkout: refresh it in place, but never discard it.
+            self.checkout = self.dest  # let _pull_blocking fetch into the existing tree
+            try:
+                outcome = await asyncio.to_thread(self._pull_blocking)
+            except _SOURCE_UNAVAILABLE as exc:
+                outcome = await asyncio.to_thread(self._serve_existing)
+                self._apply(outcome, source_available=False, last_pull_error=str(exc))
+            else:
+                self._apply(outcome, source_available=True, last_pull_error=None)
+            return
+        # Absent or corrupt: a fresh clone is the only servable option (clone_owner
+        # rmtree's a corrupt dir first). A source outage here has nothing to fall
+        # back to, so the failure is stamped and re-raised into the failed state.
+        try:
+            outcome = await asyncio.to_thread(self._clone_blocking)
+        except _SOURCE_UNAVAILABLE as exc:
+            self._stamp_attempt(source_available=False, error=str(exc))
+            raise
+        self._apply(outcome, source_available=True, last_pull_error=None)
 
     async def get_or_refresh(self, ttl: float) -> Server:
         """Return the owner's server, pulling first only if staler than ``ttl``.
@@ -142,12 +219,19 @@ class OwnerCache:
         so concurrent stale requests trigger a single pull; the docs and server
         are rebuilt only if the pull actually moved ``HEAD``.
 
+        A source outage during a TTL pull never breaks the request: the failed
+        attempt is stamped and the existing (now stale) server is served instead
+        of raising. Because a failed attempt does not advance the success clock,
+        the owner stays past-TTL and every later request re-attempts the pull, so
+        it self-heals the instant the source returns.
+
         Args:
             ttl: Freshness window in seconds; the owner is re-pulled once its
                 last pull is at least ``ttl`` seconds old.
 
         Returns:
-            The MCP server serving the owner's current (freshly-enough) content.
+            The MCP server serving the owner's current (freshly-enough, or stale
+            offline-fallback) content.
         """
         if self._is_fresh(ttl):
             assert self.server is not None  # freshness implies a completed load
@@ -156,8 +240,15 @@ class OwnerCache:
             if self._is_fresh(ttl):  # another request refreshed while we waited
                 assert self.server is not None
                 return self.server
-            outcome = await asyncio.to_thread(self._pull_blocking)
-            self._apply(outcome)
+            try:
+                outcome = await asyncio.to_thread(self._pull_blocking)
+            except _SOURCE_UNAVAILABLE as exc:
+                # Source down mid-serve: keep serving the last-good build, record
+                # the failed attempt, and stay past-TTL so the next request retries.
+                self._stamp_attempt(source_available=False, error=str(exc))
+                assert self.server is not None  # load() established a served server
+                return self.server
+            self._apply(outcome, source_available=True, last_pull_error=None)
             assert self.server is not None
             return self.server
 
@@ -168,13 +259,29 @@ class OwnerCache:
         the owner's lock like :meth:`get_or_refresh`, so it never races an
         in-flight TTL pull into a double-pull.
 
+        Unlike :meth:`get_or_refresh`, an explicit refresh reports a source outage
+        loudly: the failed attempt is stamped and the owner keeps serving its
+        last-good build, but a :class:`RefreshUnavailable` is raised so the route
+        can answer ``502``. The content path is untouched, so MCP requests for the
+        owner continue to succeed.
+
         Returns:
             A :class:`RefreshResult` naming the owner, ref, served commit, and
             number of docs loaded.
+
+        Raises:
+            RefreshUnavailable: If the git source is unreachable or its south
+                credential is unset; the owner keeps serving its last-good commit.
         """
         async with self.lock:
-            outcome = await asyncio.to_thread(self._pull_blocking)
-            self._apply(outcome)
+            try:
+                outcome = await asyncio.to_thread(self._pull_blocking)
+            except _SOURCE_UNAVAILABLE as exc:
+                self._stamp_attempt(source_available=False, error=str(exc))
+                raise RefreshUnavailable(
+                    served_commit=self.commit, error=str(exc)
+                ) from exc
+            self._apply(outcome, source_available=True, last_pull_error=None)
             return RefreshResult(
                 owner=self.resolved.owner,
                 ref=self.resolved.ref,
@@ -231,19 +338,98 @@ class OwnerCache:
         docs = self._scan_docs(checkout)
         return _PullOutcome(checkout, docs, build_server(docs), after)
 
+    def _valid_checkout_exists(self, dest: Path) -> bool:
+        """Report whether ``dest`` holds a git checkout with a resolvable ``HEAD``.
+
+        The integrity gate for the offline fallback: a directory that exists and
+        whose ``git rev-parse HEAD`` succeeds is servable last-good content and is
+        never discarded; an absent or corrupt checkout (missing ``.git``,
+        unresolvable ``HEAD``) has no fallback value and is re-cloned instead.
+
+        Args:
+            dest: The owner's checkout directory to probe.
+
+        Returns:
+            ``True`` if ``dest`` is a git checkout with a resolvable ``HEAD``.
+        """
+        if not dest.exists():
+            return False
+        try:
+            head_commit(dest)
+        except CalledProcessError:
+            return False
+        return True
+
+    def _serve_existing(self) -> _PullOutcome:
+        """Build a server from the on-disk checkout without contacting the source.
+
+        The offline-fallback counterpart of :meth:`_pull_blocking`'s unchanged-tree
+        branch: scans the current checkout and builds a server from its present
+        ``HEAD``, so a source outage keeps serving the last-good content already in
+        the volume. Only called after :meth:`_valid_checkout_exists` confirmed
+        ``HEAD`` resolves, so ``head_commit`` here cannot fail.
+        """
+        checkout = self.dest
+        docs = self._scan_docs(checkout)
+        return _PullOutcome(
+            checkout=checkout,
+            docs=docs,
+            server=build_server(docs),
+            commit=head_commit(checkout),
+        )
+
     def _scan_docs(self, checkout: Path) -> list[ParsedDoc]:
         """Reuse the stdio ``load_docs`` verbatim against the owner's checkout."""
         config = ServerConfig(owner=self.resolved.owner, roots=(checkout,))
         return load_docs(config)
 
-    def _apply(self, outcome: _PullOutcome) -> None:
-        """Swap in a pull's result on the loop in one step and stamp both clocks."""
+    def _apply(
+        self,
+        outcome: _PullOutcome,
+        *,
+        source_available: bool,
+        last_pull_error: str | None,
+    ) -> None:
+        """Swap in a pull/serve result on the loop and stamp the attempt clocks.
+
+        Always records the attempt (``source_available``, ``last_pull_attempt_at``,
+        ``last_pull_error``). The success clocks (``last_pulled`` /
+        ``last_pulled_wall``, which gate TTL freshness and render ``last_pulled_at``)
+        are stamped **only** when ``source_available`` is true: a stale offline
+        fallback swaps in on-disk content without claiming a fresh pull, so it stays
+        past-TTL and keeps re-attempting until the source returns.
+
+        Args:
+            outcome: The clone/pull/serve result to serve.
+            source_available: Whether this outcome came from a successful git pull
+                (true) or an offline fallback to the existing checkout (false).
+            last_pull_error: Token-free error to record, or ``None`` on success.
+        """
         self.checkout = outcome.checkout
         self.docs = outcome.docs
         self.server = outcome.server
         self.commit = outcome.commit
-        self.last_pulled = self._clock()
-        self.last_pulled_wall = self._wall_clock()
+        self._stamp_attempt(source_available=source_available, error=last_pull_error)
+        if source_available:
+            self.last_pulled = self._clock()
+            self.last_pulled_wall = self._wall_clock()
+
+    def _stamp_attempt(self, *, source_available: bool, error: str | None) -> None:
+        """Record a pull attempt's outcome without swapping the served content.
+
+        Used when a refresh fails while a good server is already being served: the
+        served content and its ``last_pulled`` success clock are left intact so the
+        owner keeps answering, while ``source_available`` / ``last_pull_attempt_at``
+        / ``last_pull_error`` reflect the failed attempt (and the unchanged success
+        clock keeps the owner past-TTL, so the next request re-attempts).
+
+        Args:
+            source_available: Whether the just-finished attempt reached the source.
+            error: Token-free error string for a failed attempt, else ``None``.
+        """
+        self.source_available = source_available
+        self.last_pull_attempt_at = self._wall_clock()
+        self.last_pull_error = error
 
 
-__all__ = ["OwnerCache", "RefreshResult"]
+__all__ = ["OwnerCache", "RefreshResult", "RefreshUnavailable"]
