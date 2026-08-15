@@ -78,3 +78,32 @@ launchd/systemd, live-Bitbucket integration tests.
 
 TASK-6 and TASK-7 both depend on TASK-5 and are independent siblings; TASK-8
 depends on TASK-7 (needs auth env/config) and TASK-6.
+
+## Upstream: how owner content is published (Ralph push)
+
+The gateway is a pure **downstream consumer** of git content: it
+shallow-clones each owner's repo into its own cache and re-pulls on a TTL or
+on an explicit `POST /{owner}/refresh` (see `owner_cache.py`). New content
+becomes visible to the gateway only *after* it has been pushed to the source
+repo's `origin/master`. That push is an automated step of the **producing**
+project's Ralph loop, documented in Ralph's task-execution lifecycle guide:
+**"Task Execution Lifecycle and Push Mechanisms"** (`doc-5` in the
+`dddpaul-ralph` plugin repo — `backlog doc view doc-5` there).
+
+The specific channel is doc-5's **post-loop publish** (§4.2): once a Ralph run
+finishes merging its task branches to local `master`, `maybe_push_after_loop()`
+in `plugins/ralph/skills/ralph-run/scripts/ralph/push.py` runs `git push origin
+master` — but only when three gates all hold: not opted out (`push_enabled()` —
+no `--no-push` / `RALPH_NO_PUSH`), an `origin` remote exists
+(`has_origin_remote()`), and `master` advanced during the run. doc-5 also
+enumerates Ralph's other push channels: per-commit hash stamping (§4.1),
+`push.followTags` + the pre-push version-bump guard (§4.3), `/plugin update`
+marketplace refresh (§4.4), `/ralph-handoff` cross-project task push (§4.5),
+and the status-file + heartbeat surfaces (§4.6).
+
+This is the **push** half of the `merge→push→pull` chain the gateway's
+`served_commit` lets a consumer verify (README, "Freshness signals:
+`served_commit` vs `content_hash`"): Ralph merges and pushes upstream; the
+gateway pulls and advances `served_commit`; a downstream reader can confirm a
+known merge commit is an ancestor of `served_commit` before acting on the
+content.
