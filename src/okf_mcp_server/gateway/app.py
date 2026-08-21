@@ -49,6 +49,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from ..server import ParsedDoc
 from .owner_cache import OwnerCache, RefreshUnavailable
 from .registry import Registry
 
@@ -259,7 +260,45 @@ def _effective_config(
     }
 
 
-def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
+def _artifact_entries(docs: list[ParsedDoc]) -> list[dict[str, Any]]:
+    """Render an owner's served docs as the ``artifacts`` inventory for ``/status``.
+
+    A ``knowledge://`` URI names an individual doc, so this metadata is per-doc,
+    not per-owner: it is what turns a bare ref into something a mesh consumer can
+    act on ("what IS this artifact?"). Every field is read straight off the
+    already-loaded :class:`~okf_mcp_server.server.ParsedDoc`, so rendering is a
+    pure in-memory read with no filesystem or git access. ``summary`` is the doc's
+    ``description`` — renamed here because a consumer reading an inventory wants a
+    summary of the artifact, while ``description`` is the MCP resource field name.
+
+    Per-doc freshness is deliberately absent: freshness is an owner-level signal
+    (the owner's whole checkout moves together), and the per-doc change signal is
+    ``content_hash``, which is already here.
+
+    Args:
+        docs: The owner's currently served docs (empty while loading or failed).
+
+    Returns:
+        One JSON-serializable mapping per doc, in served order.
+    """
+    return [
+        {
+            "uri": doc.uri,
+            "id": doc.id,
+            "type": doc.type,
+            "title": doc.title,
+            "summary": doc.description,
+            "path": doc.path,
+            "size": doc.size,
+            "content_hash": doc.content_hash,
+        }
+        for doc in docs
+    ]
+
+
+def _owner_status(
+    owners: dict[str, OwnerState], *, artifacts: bool = False
+) -> dict[str, Any]:
     """Assemble live per-owner runtime state for ``GET /status``.
 
     A pure read of current in-memory state — it never triggers a pull or any
@@ -283,8 +322,17 @@ def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
     deliberately not echoed — that is config, and omitting it keeps a redaction
     surface off this endpoint.
 
+    ``artifacts`` adds each owner's per-doc inventory (see
+    :func:`_artifact_entries`) alongside the counts. It is opt-in so the default
+    payload stays a lean state read: ``docs_loaded`` is one integer, while the
+    inventory grows with an owner's doc count.
+
     Args:
         owners: The app's per-owner runtime states, keyed by owner name.
+        artifacts: When true, add an ``artifacts`` array to every owner entry —
+            empty for an owner with no docs on hand (loading or failed). When
+            false (the default) the key is absent entirely, leaving the payload
+            byte-identical to what it was before artifacts existed.
 
     Returns:
         A JSON/YAML-serializable mapping with a top-level ``summary`` counts block
@@ -303,6 +351,9 @@ def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
         counts[owner_state] += 1
         # Read the stamps into locals: no await runs before they are used, so the
         # group is a consistent snapshot even if a pull applies concurrently.
+        # ``docs`` joins them so ``docs_loaded`` counts exactly the list the
+        # ``artifacts`` inventory below is rendered from.
+        docs = cache.docs
         last_pulled = cache.last_pulled
         last_pulled_wall = cache.last_pulled_wall
         last_pull_attempt_at = cache.last_pull_attempt_at
@@ -314,7 +365,7 @@ def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
             "source_available": cache.source_available,
             # stale = serving last-good content while the source is unreachable.
             "stale": cache.source_available is False and cache.commit is not None,
-            "docs_loaded": len(cache.docs),
+            "docs_loaded": len(docs),
             "last_pulled_at": (
                 None if last_pulled_wall is None else _iso_utc(last_pulled_wall)
             ),
@@ -328,6 +379,8 @@ def _owner_status(owners: dict[str, OwnerState]) -> dict[str, Any]:
                 None if last_pull_error is None else _scrub_credentials(last_pull_error)
             ),
         }
+        if artifacts:
+            entry["artifacts"] = _artifact_entries(docs)
         if owner_state == "failed":
             error = state.error
             entry["error"] = {
@@ -367,7 +420,8 @@ def create_app(
     ``?format=yaml``); like every route but ``/healthz`` it sits behind the north
     token, so it never leaks config to an anonymous caller. ``GET /status`` is its
     live-runtime sibling: a pure read (never a pull) reporting each owner's state,
-    served in the same JSON/``?format=yaml`` shape and behind the same token.
+    served in the same JSON/``?format=yaml`` shape and behind the same token, and
+    optionally each owner's per-doc artifact inventory with ``?artifacts=true``.
 
     Args:
         registry: Validated registry; its owners form the allowlist and its
@@ -433,7 +487,19 @@ def create_app(
                 {"error": f"unsupported format {fmt!r}; use 'json' or 'yaml'"},
                 status_code=400,
             )
-        payload = _owner_status(owners)
+        # Validated against an allowlist like ?format=, rather than treating any
+        # non-"true" value as false: a typo (?artifacts=1) then fails loudly
+        # instead of silently returning a payload with no inventory in it.
+        want_artifacts = request.query_params.get("artifacts", "false").lower()
+        if want_artifacts not in ("true", "false"):
+            return JSONResponse(
+                {
+                    "error": f"unsupported artifacts {want_artifacts!r}; "
+                    f"use 'true' or 'false'"
+                },
+                status_code=400,
+            )
+        payload = _owner_status(owners, artifacts=want_artifacts == "true")
         if fmt == "yaml":
             body = yaml.safe_dump(payload, sort_keys=False)
             return PlainTextResponse(body, media_type="application/yaml")

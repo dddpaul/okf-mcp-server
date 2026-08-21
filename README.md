@@ -323,6 +323,66 @@ curl -fsS "http://localhost:8080/status?format=yaml" \
   -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # YAML
 ```
 
+#### Per-doc artifact inventory: `?artifacts=true`
+
+`served_commit` and `docs_loaded` describe an *owner*; they say nothing about the
+individual docs behind it. A consumer handed a bare `knowledge://owner/type/id`
+ref therefore cannot tell **what the artifact is** without reading it.
+`GET /status?artifacts=true` closes that gap: every owner entry gains an
+`artifacts` array with one object per served doc.
+
+| field | meaning |
+| --- | --- |
+| `uri` | the `knowledge://owner/type-slug/id` ref itself |
+| `id` | the doc's stable id (the contract — the slug is not) |
+| `type` | the raw frontmatter `type`, e.g. `Architecture Decision` |
+| `title` | the doc title |
+| `summary` | the doc `description` (declared, or the derived first paragraph) |
+| `path` | location **relative to the repo root**, e.g. `design/adr.md` |
+| `size` | **characters** of served content, frontmatter stripped — not bytes |
+| `content_hash` | the same `sha256:<hex>` each MCP resource carries in `_meta` |
+
+`path` is deliberately repo-relative rather than the absolute checkout path: the
+absolute form leaks the gateway's internal filesystem layout and is meaningless
+off-box, while the relative one is what a human or a tool can act on in the
+source repo.
+
+`size` counts **characters** of the served string, not UTF-8 bytes: a doc holding
+non-ASCII text (an em-dash, an arrow, `§`) encodes to more bytes than `size`
+reports, so do not use it to size a byte buffer or a `Content-Length`.
+
+The array is **opt-in**. Without the parameter — or with `?artifacts=false` —
+the payload is exactly as shown above, with no `artifacts` key; `docs_loaded` is
+one integer, whereas the inventory grows with an owner's doc count. Any other
+value is a `400`, so a typo fails loudly instead of quietly returning nothing. An
+owner with no docs on hand (`loading` or `failed`) reports `"artifacts": []`, so
+the shape never varies by owner state. Per-doc *freshness* is deliberately absent:
+freshness is an owner-level signal (the whole checkout moves together), and the
+per-doc change signal is `content_hash` — see *Freshness signals* below.
+
+One owner's entry, abbreviated (the offline-fallback fields are unchanged):
+
+```json
+{
+  "state": "serving", "ref": "main", "served_commit": "1a2b3c4d…",
+  "docs_loaded": 2,
+  "artifacts": [
+    {
+      "uri": "knowledge://acme/architecture-decision/st-adr-1",
+      "id": "st-adr-1", "type": "Architecture Decision",
+      "title": "Status ADR", "summary": "The status decision body.",
+      "path": "design/adr.md", "size": 39,
+      "content_hash": "sha256:87204096…"
+    }
+  ]
+}
+```
+
+```sh
+curl -fsS "http://localhost:8080/status?artifacts=true" \
+  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"
+```
+
 #### Offline fallback and `POST /{owner}/refresh`
 
 The persisted cache volume is an **authoritative offline fallback**. If an owner
