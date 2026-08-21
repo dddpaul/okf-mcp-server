@@ -453,3 +453,68 @@ def test_load_docs_dedups_symlinked_doc_to_unique_uri(tmp_path: Path) -> None:
     (only,) = [d for d in docs if d.uri == "knowledge://stacks/readme/doc-1"]
     assert only.content != ""
     assert only.content == frontmatter.load(canonical).content
+
+
+def test_load_docs_records_path_relative_to_the_scan_root(tmp_path: Path) -> None:
+    """``path`` locates a doc within the root it was scanned under, not on disk.
+
+    The gateway scans an owner's checkout as a single root, so this is exactly the
+    repo-relative path it surfaces on ``GET /status?artifacts=true`` — an absolute
+    checkout path would leak the gateway's filesystem layout and be unusable
+    remotely.
+    """
+    root = tmp_path / "checkout"
+    _write(root / "docs", "top.md", _front("type: Doc\nexport: true\nid: a\n"))
+    _write(
+        root / "design" / "adr",
+        "nested.md",
+        _front("type: Decision\nexport: true\nid: b\n"),
+    )
+
+    docs = load_docs(_config("stacks", (root,)))
+
+    by_id = {d.id: d for d in docs}
+    assert by_id["a"].path == "docs/top.md"
+    assert by_id["b"].path == "design/adr/nested.md"  # slash-separated, any depth
+    # Relative to the root: neither the absolute prefix nor a leading slash leaks.
+    for doc in docs:
+        assert not Path(doc.path).is_absolute()
+        assert str(tmp_path) not in doc.path
+
+
+def test_parsed_doc_size_is_the_length_of_the_served_content() -> None:
+    doc = ParsedDoc(
+        owner="stacks",
+        type="Doc",
+        type_slug="doc",
+        id="a",
+        title="t",
+        description="d",
+        content="BODY BYTES",
+    )
+    assert doc.size == len(doc.content) == 10
+
+
+def test_load_docs_size_measures_the_body_not_the_file(tmp_path: Path) -> None:
+    """``size`` covers the served content only — frontmatter is already stripped."""
+    root = tmp_path / "checkout"
+    path = _write(root, "doc.md", _front("type: Doc\nexport: true\nid: a\n"))
+
+    (doc,) = load_docs(_config("stacks", (root,)))
+
+    assert doc.size == len(doc.content)
+    assert doc.size < len(path.read_text(encoding="utf-8"))  # frontmatter excluded
+
+
+def test_parsed_doc_path_defaults_to_empty_so_the_field_is_additive() -> None:
+    """A doc built without a root still constructs; ``path`` is opt-in metadata."""
+    doc = ParsedDoc(
+        owner="stacks",
+        type="Doc",
+        type_slug="doc",
+        id="a",
+        title="t",
+        description="d",
+        content="c",
+    )
+    assert doc.path == ""

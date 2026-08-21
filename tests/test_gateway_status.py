@@ -476,3 +476,227 @@ def test_status_gated_by_bearer_token_while_healthz_stays_open(
     assert NORTH_TOKEN not in correct.text  # north token itself is never echoed back
     assert health.status_code == 200  # health check stays open with auth enabled
     assert health.text == "ok"
+
+
+# The exact per-artifact field set the inventory contract promises.
+ARTIFACT_KEYS = {
+    "uri",
+    "id",
+    "type",
+    "title",
+    "summary",
+    "path",
+    "size",
+    "content_hash",
+}
+
+
+def test_status_artifacts_true_returns_per_doc_metadata(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """``?artifacts=true`` turns each owner's docs into an actionable inventory.
+
+    A bare ``knowledge://`` ref says nothing about what the artifact *is*; this
+    asserts the fields that make it concrete — the repo-relative location, the
+    type, and a summary — against ground truth taken from the fixture itself.
+    """
+    acme = make_bare_repo(FIXTURE_FILES, ref="main")
+    app = create_app(
+        Registry(owners={"acme": OwnerSpec(url=acme.url, ref=acme.ref)}),
+        tmp_path / "cache",
+    )
+
+    body = asyncio.run(
+        _get_status_ready(app, ("acme",), params={"artifacts": "true"})
+    ).json()
+
+    owner = body["owners"]["acme"]
+    artifacts = owner["artifacts"]
+    assert len(artifacts) == owner["docs_loaded"] == 2  # the un-exported README is out
+    for artifact in artifacts:
+        assert set(artifact) == ARTIFACT_KEYS
+    by_id = {a["id"]: a for a in artifacts}
+
+    # Paths are repo-relative to the checkout root: exactly the fixture's own keys,
+    # so neither the absolute checkout prefix nor the cache dir layout leaks out.
+    assert {a["path"] for a in artifacts} == {"docs/reference.md", "design/adr.md"}
+    assert str(tmp_path) not in str(artifacts)
+
+    reference = by_id["st-ref-1"]
+    assert reference["uri"] == "knowledge://acme/reference-doc/st-ref-1"
+    assert reference["path"] == "docs/reference.md"
+    assert reference["type"] == "Reference Doc"  # the raw type, not the URI slug
+    assert reference["title"] == "Status Reference"
+    # summary is the doc's description — verbatim from the fixture frontmatter.
+    assert reference["summary"] == "Reference served under the status tests."
+
+    decision = by_id["st-adr-1"]
+    assert decision["uri"] == "knowledge://acme/architecture-decision/st-adr-1"
+    assert decision["path"] == "design/adr.md"
+    assert decision["type"] == "Architecture Decision"
+    # This fixture declares no description, so the summary is the derived one.
+    assert decision["summary"] == "The status decision body."
+
+
+def test_status_artifact_size_and_hash_describe_the_served_content(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """``size``/``content_hash`` measure the served body, not the on-disk file."""
+    acme = make_bare_repo(FIXTURE_FILES, ref="main")
+    app = create_app(
+        Registry(owners={"acme": OwnerSpec(url=acme.url, ref=acme.ref)}),
+        tmp_path / "cache",
+    )
+
+    body = asyncio.run(
+        _get_status_ready(app, ("acme",), params={"artifacts": "true"})
+    ).json()
+
+    # The served docs are what read_resource hands a consumer; the inventory must
+    # describe those exact strings.
+    served = {d.id: d for d in app.state.owners["acme"].cache.docs}
+    for artifact in body["owners"]["acme"]["artifacts"]:
+        doc = served[artifact["id"]]
+        assert artifact["size"] == len(doc.content)
+        assert artifact["content_hash"] == doc.content_hash
+    # Independent of the loader: the frontmatter block is excluded from both the
+    # size and the served content it is taken over.
+    reference = next(
+        a for a in body["owners"]["acme"]["artifacts"] if a["id"] == "st-ref-1"
+    )
+    assert 0 < reference["size"] < len(REFERENCE_DOC)
+    assert "export: true" not in served["st-ref-1"].content
+
+
+def test_status_omits_artifacts_by_default_and_when_explicitly_false(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """The default payload is untouched — the inventory is strictly opt-in.
+
+    Both clocks are injected so the three responses are byte-comparable; without
+    that, ``last_pulled_age_seconds`` could tick between them.
+    """
+    acme = make_bare_repo(FIXTURE_FILES, ref="main")
+    fixed_wall = datetime(2026, 7, 17, 7, 46, 46, tzinfo=timezone.utc)
+    app = create_app(
+        Registry(owners={"acme": OwnerSpec(url=acme.url, ref=acme.ref)}),
+        tmp_path / "cache",
+        clock=FakeClock(),
+        wall_clock=lambda: fixed_wall.timestamp(),
+    )
+
+    async def scenario() -> tuple[httpx.Response, httpx.Response, httpx.Response]:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as client:
+                await asyncio.wait_for(
+                    app.state.owners["acme"].ready.wait(), timeout=15
+                )
+                return (
+                    await client.get("/status"),
+                    await client.get("/status", params={"artifacts": "false"}),
+                    await client.get("/status", params={"artifacts": "true"}),
+                )
+
+    default, explicit_false, opted_in = asyncio.run(scenario())
+
+    assert default.status_code == explicit_false.status_code == 200
+    # Byte-for-byte: opting out changes nothing about the pre-existing payload.
+    assert default.text == explicit_false.text
+    assert "artifacts" not in default.text
+    assert "artifacts" not in explicit_false.json()["owners"]["acme"]
+    # ...and the only difference under ?artifacts=true is the added key.
+    opted_in_owner = opted_in.json()["owners"]["acme"]
+    assert set(opted_in_owner) - set(default.json()["owners"]["acme"]) == {"artifacts"}
+
+
+def test_status_artifacts_rejects_an_unsupported_value(tmp_path: Path) -> None:
+    """A typo fails loudly rather than silently serving an inventory-free payload."""
+    # No lifespan is entered, so no clone runs — the query parsing is all this needs.
+    app = create_app(
+        Registry(owners={"acme": OwnerSpec(url="https://git.example.invalid/a.git")}),
+        tmp_path / "cache",
+    )
+    client = TestClient(app)
+
+    bad = client.get("/status", params={"artifacts": "1"})
+    unset = client.get("/status")
+
+    assert bad.status_code == 400
+    assert "artifacts" in bad.json()["error"]
+    assert unset.status_code == 200  # the param stays optional
+
+
+def test_status_artifacts_is_an_empty_list_for_an_owner_with_no_docs(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed owner still carries the key, so the shape never varies by state."""
+    acme = make_bare_repo(FIXTURE_FILES, ref="main")
+    monkeypatch.setattr(
+        owner_cache_module,
+        "clone_owner",
+        _failing_clone(BETA_URL, RuntimeError("boom")),
+    )
+    app = create_app(
+        Registry(
+            owners={
+                "acme": OwnerSpec(url=acme.url, ref=acme.ref),
+                "beta": OwnerSpec(url=BETA_URL, ref="release"),
+            }
+        ),
+        tmp_path / "cache",
+    )
+
+    body = asyncio.run(
+        _get_status_ready(app, ("acme", "beta"), params={"artifacts": "true"})
+    ).json()
+
+    beta = body["owners"]["beta"]
+    assert beta["state"] == "failed"
+    assert beta["artifacts"] == []  # present but empty, not missing
+    assert len(body["owners"]["acme"]["artifacts"]) == 2
+
+
+def test_status_artifacts_round_trip_through_yaml(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """``?artifacts=`` composes with ``?format=``; both renderings agree."""
+    acme = make_bare_repo(FIXTURE_FILES, ref="main")
+    fixed_wall = datetime(2026, 7, 17, 7, 46, 46, tzinfo=timezone.utc)
+    app = create_app(
+        Registry(owners={"acme": OwnerSpec(url=acme.url, ref=acme.ref)}),
+        tmp_path / "cache",
+        clock=FakeClock(),
+        wall_clock=lambda: fixed_wall.timestamp(),
+    )
+
+    async def scenario() -> tuple[httpx.Response, httpx.Response]:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as client:
+                await asyncio.wait_for(
+                    app.state.owners["acme"].ready.wait(), timeout=15
+                )
+                return (
+                    await client.get("/status", params={"artifacts": "true"}),
+                    await client.get(
+                        "/status", params={"artifacts": "true", "format": "yaml"}
+                    ),
+                )
+
+    json_resp, yaml_resp = asyncio.run(scenario())
+
+    assert yaml_resp.status_code == 200
+    assert yaml_resp.headers["content-type"].startswith("application/yaml")
+    assert yaml.safe_load(yaml_resp.text) == json_resp.json()
+    assert "docs/reference.md" in yaml_resp.text

@@ -31,6 +31,25 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 @dataclass(frozen=True)
 class ParsedDoc:
+    """One exported document, as scanned from a scan root.
+
+    Attributes:
+        owner: Owner the doc is served under (the ``knowledge://<owner>/`` segment).
+        type: The frontmatter ``type``, verbatim.
+        type_slug: ``type`` slugified into the URI segment.
+        id: Stable document id; the contract is held here, not by the slug.
+        title: Frontmatter ``title``, falling back to the file stem.
+        description: Frontmatter ``description``, falling back to the first
+            non-heading paragraph of the body.
+        content: The served body, with the frontmatter block stripped.
+        path: Slash-separated location of the source file relative to the scan
+            root it was found under. The gateway scans an owner's checkout as a
+            single root, so there ``path`` is repo-relative — the form a remote
+            consumer or a human can act on, unlike the absolute checkout path
+            (which leaks the gateway's internal filesystem layout and means
+            nothing off-box). Defaults to ``""`` for a doc built without a root.
+    """
+
     owner: str
     type: str
     type_slug: str
@@ -38,10 +57,23 @@ class ParsedDoc:
     title: str
     description: str
     content: str
+    path: str = ""
 
     @property
     def uri(self) -> str:
         return f"knowledge://{self.owner}/{self.type_slug}/{self.id}"
+
+    @property
+    def size(self) -> int:
+        """Return the length of the served content.
+
+        Measured over ``content`` — exactly the string ``read_resource`` returns,
+        frontmatter already stripped — so it describes the served representation
+        rather than the on-disk file. It is a character count, not a byte count:
+        for the ASCII-dominant markdown served here the two coincide, but a doc
+        with non-ASCII text encodes to more UTF-8 bytes than this reports.
+        """
+        return len(self.content)
 
     @property
     def content_hash(self) -> str:
@@ -89,7 +121,19 @@ def _iter_markdown_files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*.md") if p.is_file() and not p.is_symlink())
 
 
-def _build_doc(owner: str, path: Path) -> ParsedDoc | None:
+def _build_doc(owner: str, path: Path, root: Path) -> ParsedDoc | None:
+    """Parse one markdown file into a :class:`ParsedDoc`, or ``None`` if not exported.
+
+    Args:
+        owner: Owner name the doc is served under.
+        path: The markdown file to parse.
+        root: The scan root ``path`` was found under; ``path`` is recorded
+            relative to it. Callers pass the same root they enumerated with, so
+            ``path`` is always contained in it.
+
+    Returns:
+        The parsed doc, or ``None`` when the file is not an exported OKF doc.
+    """
     fm = frontmatter.load(path)
     if fm.metadata.get("export") is not True:
         return None
@@ -110,6 +154,9 @@ def _build_doc(owner: str, path: Path) -> ParsedDoc | None:
         title=title,
         description=str(desc),
         content=fm.content,
+        # Never raises: _iter_markdown_files yields only ``root.rglob`` results,
+        # so every path handed here is contained in the root it came from.
+        path=path.relative_to(root).as_posix(),
     )
 
 
@@ -122,7 +169,7 @@ def load_docs(config: ServerConfig) -> list[ParsedDoc]:
     seen: set[str] = set()
     for root in config.roots:
         for path in _iter_markdown_files(root):
-            doc = _build_doc(config.owner, path)
+            doc = _build_doc(config.owner, path, root)
             if doc is not None and doc.uri not in seen:
                 seen.add(doc.uri)
                 docs.append(doc)
