@@ -69,9 +69,10 @@ class ParsedDoc:
 
         Measured over ``content`` — exactly the string ``read_resource`` returns,
         frontmatter already stripped — so it describes the served representation
-        rather than the on-disk file. It is a character count, not a byte count:
-        for the ASCII-dominant markdown served here the two coincide, but a doc
-        with non-ASCII text encodes to more UTF-8 bytes than this reports.
+        rather than the on-disk file. It counts **characters**, not bytes: the two
+        coincide only for a pure-ASCII doc, and real OKF markdown routinely is not
+        (an em-dash, an arrow, or ``§`` each cost extra UTF-8 bytes). A consumer
+        sizing a byte buffer must encode and measure rather than trust this.
         """
         return len(self.content)
 

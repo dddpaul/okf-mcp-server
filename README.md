@@ -339,13 +339,17 @@ ref therefore cannot tell **what the artifact is** without reading it.
 | `title` | the doc title |
 | `summary` | the doc `description` (declared, or the derived first paragraph) |
 | `path` | location **relative to the repo root**, e.g. `design/adr.md` |
-| `size` | length of the served content, frontmatter already stripped |
+| `size` | **characters** of served content, frontmatter stripped — not bytes |
 | `content_hash` | the same `sha256:<hex>` each MCP resource carries in `_meta` |
 
 `path` is deliberately repo-relative rather than the absolute checkout path: the
 absolute form leaks the gateway's internal filesystem layout and is meaningless
 off-box, while the relative one is what a human or a tool can act on in the
 source repo.
+
+`size` counts **characters** of the served string, not UTF-8 bytes: a doc holding
+non-ASCII text (an em-dash, an arrow, `§`) encodes to more bytes than `size`
+reports, so do not use it to size a byte buffer or a `Content-Length`.
 
 The array is **opt-in**. Without the parameter — or with `?artifacts=false` —
 the payload is exactly as shown above, with no `artifacts` key; `docs_loaded` is
@@ -354,7 +358,7 @@ value is a `400`, so a typo fails loudly instead of quietly returning nothing. A
 owner with no docs on hand (`loading` or `failed`) reports `"artifacts": []`, so
 the shape never varies by owner state. Per-doc *freshness* is deliberately absent:
 freshness is an owner-level signal (the whole checkout moves together), and the
-per-doc change signal is `content_hash` — see the next section.
+per-doc change signal is `content_hash` — see *Freshness signals* below.
 
 One owner's entry, abbreviated (the offline-fallback fields are unchanged):
 
