@@ -296,6 +296,66 @@ def _artifact_entries(docs: list[ParsedDoc]) -> list[dict[str, Any]]:
     ]
 
 
+def _freshness(
+    *, commit: str | None, source_available: bool, age_seconds: int | None, ttl: float
+) -> str:
+    """Rank an owner's serving freshness into one of four authoritative states.
+
+    The producer computes this verdict so no consumer has to re-derive it from the
+    primitives (and get it wrong — a ``null`` verdict beside a moved
+    ``served_commit`` is exactly the failure this closes). The precedence is fixed:
+
+    ==================================  ============  ==================================
+    Condition (first match wins)        Verdict       Meaning
+    ==================================  ============  ==================================
+    ``commit`` is None                  ``unknown``   Never loaded (loading, or failed
+                                                      with an empty volume).
+    ``source_available`` is False       ``stale``     Offline fallback: serving
+                                                      last-good content while the
+                                                      source is down.
+    ``age_seconds`` > ``ttl``           ``stale_ttl`` Source reachable, refresh due on
+                                                      the next content request.
+    otherwise                           ``fresh``     Serving the last successful pull,
+                                                      within TTL.
+    ==================================  ============  ==================================
+
+    Source-down outranks past-TTL because "a refresh is due" is meaningless while
+    the source is unreachable. A ``None`` ``age_seconds`` (a commit on hand that no
+    successful pull in this process stamped) falls through to ``fresh``: the source
+    is reachable and content is being served, and there is no age to call past-TTL.
+
+    The TTL comparison is strictly greater-than, and it is made against the same
+    whole-second ``age_seconds`` that ``/status`` renders — so the verdict never
+    contradicts the age printed beside it (``last_pulled_age_seconds: 60`` next to
+    ``stale_ttl`` at ``ttl: 60`` would read as a contradiction). The cost is that
+    this lags :meth:`OwnerCache._is_fresh`'s float ``< ttl`` gate by under a
+    second, during which an owner reads ``fresh`` though the next content request
+    would pull. That is a display-precision skew on a debugging read, not a
+    correctness one: ``/status`` never pulls, so the two are never asked to agree.
+
+    This is **serving**-freshness, not source-freshness: ``fresh`` says "current as
+    of my last successful source contact, within TTL", never "the source has not
+    advanced" — ``/status`` deliberately makes no network probe.
+
+    Args:
+        commit: The owner's served ``HEAD`` SHA, or ``None`` before any load.
+        source_available: Whether the owner's most recent git attempt succeeded.
+        age_seconds: Seconds since the last *successful* pull, or ``None`` if none
+            has completed.
+        ttl: The owner's refresh window in seconds.
+
+    Returns:
+        One of ``"unknown"``, ``"stale"``, ``"stale_ttl"``, ``"fresh"``.
+    """
+    if commit is None:
+        return "unknown"
+    if not source_available:
+        return "stale"
+    if age_seconds is not None and age_seconds > ttl:
+        return "stale_ttl"
+    return "fresh"
+
+
 def _owner_status(
     owners: dict[str, OwnerState], *, artifacts: bool = False
 ) -> dict[str, Any]:
@@ -310,7 +370,11 @@ def _owner_status(
     serving a stale offline fallback: ``source_available`` is ``false`` when the
     last git attempt failed, and the derived ``stale`` flag (``source_available``
     is ``false`` with content on hand) marks that the served content is last-good
-    rather than fresh. ``last_pull_attempt_at`` (wall-clock of the last *attempt*,
+    rather than fresh. ``freshness`` is the producer's own four-state verdict over
+    those same primitives (see :func:`_freshness`) — always on, with and without
+    ``?artifacts=true``, so a health poll gets the answer without re-deriving it,
+    and ``freshness == "stale"`` exactly when the ``stale`` boolean is true.
+    ``last_pull_attempt_at`` (wall-clock of the last *attempt*,
     success or fail) sits alongside ``last_pulled_at`` (age of the served
     *content*) so "still retrying every request" is distinguishable from "haven't
     retried since boot", and ``last_pull_error`` carries the scrubbed failure.
@@ -331,8 +395,9 @@ def _owner_status(
         owners: The app's per-owner runtime states, keyed by owner name.
         artifacts: When true, add an ``artifacts`` array to every owner entry —
             empty for an owner with no docs on hand (loading or failed). When
-            false (the default) the key is absent entirely, leaving the payload
-            byte-identical to what it was before artifacts existed.
+            false (the default) the key is absent entirely, so the inventory is
+            the *only* thing this flag adds; every other key, ``freshness``
+            included, is identical either way.
 
     Returns:
         A JSON/YAML-serializable mapping with a top-level ``summary`` counts block
@@ -354,24 +419,33 @@ def _owner_status(
         # ``docs`` joins them so ``docs_loaded`` counts exactly the list the
         # ``artifacts`` inventory below is rendered from.
         docs = cache.docs
+        commit = cache.commit
+        source_available = cache.source_available
         last_pulled = cache.last_pulled
         last_pulled_wall = cache.last_pulled_wall
         last_pull_attempt_at = cache.last_pull_attempt_at
         last_pull_error = cache.last_pull_error
+        age_seconds = None if last_pulled is None else int(cache._clock() - last_pulled)
         entry: dict[str, Any] = {
             "state": owner_state,
             "ref": cache.resolved.ref,
-            "served_commit": cache.commit,
-            "source_available": cache.source_available,
+            "served_commit": commit,
+            "source_available": source_available,
             # stale = serving last-good content while the source is unreachable.
-            "stale": cache.source_available is False and cache.commit is not None,
+            "stale": source_available is False and commit is not None,
+            # The producer's own verdict over the very same snapshot, so the enum
+            # can never contradict the primitives rendered beside it.
+            "freshness": _freshness(
+                commit=commit,
+                source_available=source_available,
+                age_seconds=age_seconds,
+                ttl=cache.resolved.ttl,
+            ),
             "docs_loaded": len(docs),
             "last_pulled_at": (
                 None if last_pulled_wall is None else _iso_utc(last_pulled_wall)
             ),
-            "last_pulled_age_seconds": (
-                None if last_pulled is None else int(cache._clock() - last_pulled)
-            ),
+            "last_pulled_age_seconds": age_seconds,
             "last_pull_attempt_at": (
                 None if last_pull_attempt_at is None else _iso_utc(last_pull_attempt_at)
             ),
