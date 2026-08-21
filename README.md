@@ -294,14 +294,14 @@ default; `?format=yaml` returns the same structure as YAML, and any other
   "owners": {
     "acme": {
       "state": "serving", "ref": "main", "served_commit": "1a2b3c4d…",
-      "source_available": true, "stale": false,
+      "source_available": true, "stale": false, "freshness": "fresh",
       "docs_loaded": 42, "last_pulled_at": "2026-07-17T07:46:46Z",
       "last_pulled_age_seconds": 340,
       "last_pull_attempt_at": "2026-07-17T07:46:46Z", "last_pull_error": null
     },
     "beta": {
       "state": "failed", "ref": "release", "served_commit": null,
-      "source_available": false, "stale": false,
+      "source_available": false, "stale": false, "freshness": "unknown",
       "docs_loaded": 0, "last_pulled_at": null, "last_pulled_age_seconds": null,
       "last_pull_attempt_at": "2026-07-17T07:41:12Z",
       "last_pull_error": "fatal: repository not found",
@@ -312,9 +312,49 @@ default; `?format=yaml` returns the same structure as YAML, and any other
 ```
 
 A **stale** owner (source down, healthy checkout) instead looks like `acme` with
-`"state": "serving"`, `"source_available": false`, `"stale": true`, its
-`served_commit` frozen at the pre-outage SHA, `last_pulled_at` unchanged, and a
-fresh `last_pull_attempt_at` on every request until the source returns.
+`"state": "serving"`, `"source_available": false`, `"stale": true`,
+`"freshness": "stale"`, its `served_commit` frozen at the pre-outage SHA,
+`last_pulled_at` unchanged, and a fresh `last_pull_attempt_at` on every request
+until the source returns.
+
+#### The `freshness` verdict
+
+The fields above are primitives; **`freshness`** is the gateway's own verdict
+over them, so a consumer never has to combine `source_available`,
+`last_pulled_age_seconds`, and `ttl` itself and get it wrong. It is **always
+present** on every owner (with and without `?artifacts=true`), is never `null`,
+and is always one of four values:
+
+| verdict | meaning | serving? |
+| --- | --- | --- |
+| `fresh` | Serving the last successful pull, within the owner's TTL. | yes |
+| `stale_ttl` | Source reachable, but past TTL — a refresh is due on the next content request. | yes |
+| `stale` | The last git attempt failed; serving the last-good checkout offline. | yes |
+| `unknown` | Nothing ever loaded — the clone is in flight, or it failed with no fallback. | not yet / no |
+
+First match wins, and the order matters: no commit ⇒ `unknown`; else source down
+⇒ `stale`; else past TTL ⇒ `stale_ttl`; else `fresh`. Source-down outranks
+past-TTL because "a refresh is due" is meaningless while the source is
+unreachable. The TTL comparison is strictly greater-than, so an age exactly equal
+to the TTL is still `fresh`.
+
+`freshness == "stale"` **iff** `stale == true`, so the pre-existing boolean stays
+authoritative for consumers already reading it. The converse does not hold:
+`stale: false` can still be `stale_ttl` or `unknown` — only `freshness ==
+"fresh"` means fresh.
+
+> **`fresh` is serving-freshness, not source-freshness.** It means "current as of
+> my last successful source contact, within TTL" — **not** "the source has not
+> advanced". `/status` makes no network probe (no `git ls-remote`), so it stays
+> network-free and offline-safe. To confirm a specific upstream change landed,
+> check `served_commit`; to detect whether one artifact changed, check its
+> `content_hash`.
+
+Freshness is per-owner, never per-doc: an owner's docs all come from one checkout
+that moves as a unit. Mesh-level conclusions such as `blocked_upstream` are
+derived **by the consumer** from `unknown`/`stale`; the gateway never emits them.
+Full normative definition, transition table, and producer/consumer boundary:
+`backlog doc view doc-2` (*Owner Freshness Semantics*).
 
 ```sh
 curl -fsS http://localhost:8080/status \
@@ -426,6 +466,13 @@ fresh before acting on it:
   consumer can detect a **no-op wake** (the owner's commit moved, but the specific
   artifact it depends on is unchanged → skip re-running) and pin content-addressed
   dependencies.
+
+Both answer questions *about the content*. The per-owner **`freshness`** verdict
+(above) answers the prior question — *"is this owner's content worth trusting
+right now?"* — and, unlike these two, it is a judgement the gateway makes rather
+than an identifier it reports. A consumer typically reads `freshness` first to
+decide whether to act at all, then `served_commit` / `content_hash` to decide
+what changed.
 
 In short: `served_commit` is *where did this come from*, `content_hash` is *is
 this the artifact I need*. The gateway only **exposes** these two signals; the

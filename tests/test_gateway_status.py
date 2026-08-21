@@ -11,10 +11,12 @@ injected so ``last_pulled_at`` and ``last_pulled_age_seconds`` are deterministic
 from __future__ import annotations
 
 import asyncio
+import shutil
 import threading
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -141,6 +143,7 @@ def test_status_default_json_shape_and_summary(
             "served_commit",
             "source_available",
             "stale",
+            "freshness",
             "docs_loaded",
             "last_pulled_at",
             "last_pulled_age_seconds",
@@ -150,6 +153,7 @@ def test_status_default_json_shape_and_summary(
         assert entry["state"] == "serving"
         assert entry["source_available"] is True
         assert entry["stale"] is False
+        assert entry["freshness"] == "fresh"
         assert entry["last_pull_error"] is None
         assert entry["last_pull_attempt_at"] is not None  # stamped on the load pull
 
@@ -662,6 +666,293 @@ def test_status_artifacts_is_an_empty_list_for_an_owner_with_no_docs(
     assert beta["state"] == "failed"
     assert beta["artifacts"] == []  # present but empty, not missing
     assert len(body["owners"]["acme"]["artifacts"]) == 2
+
+
+# --- Per-owner freshness verdict ---------------------------------------------
+
+# The complete enum: a verdict is always one of these, never null — an
+# authoritative producer verdict is exactly what makes a null structurally
+# impossible for a consumer that would otherwise re-derive it.
+FRESHNESS_STATES = {"fresh", "stale_ttl", "stale", "unknown"}
+
+
+def _freshness_of(entry: dict[str, Any]) -> str:
+    """Return one owner entry's verdict after asserting the enum's two invariants.
+
+    The verdict is always a defined state, and ``freshness == "stale"`` exactly
+    when the pre-existing ``stale`` boolean is true — so a consumer still reading
+    ``stale`` and one reading ``freshness`` can never disagree (back-compat).
+    """
+    verdict = entry["freshness"]
+    assert verdict in FRESHNESS_STATES, f"undefined verdict {verdict!r}"
+    assert (verdict == "stale") is entry["stale"], (
+        f"freshness {verdict!r} contradicts stale={entry['stale']!r}"
+    )
+    return str(verdict)
+
+
+def test_status_freshness_covers_all_four_states_in_one_payload(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """Every state of the precedence, driven simultaneously on four owners.
+
+    One app, one injected clock, four owners each pushed into a different state,
+    so the verdicts are proven independent per owner rather than global:
+
+    * ``fresh`` — healthy owner whose generous TTL the clock advance stays inside;
+    * ``stale_ttl`` — healthy owner whose short TTL the *same* advance crosses;
+    * ``stale`` — pre-seeded checkout whose source was removed before startup;
+    * ``unknown`` — empty volume with the source down, so nothing ever loaded.
+
+    The ``unknown`` owner is also the precedence probe that a naive
+    "check ``source_available`` first" implementation would fail: its source is
+    unreachable *and* it has no commit, and no-commit must win.
+    """
+    cache_dir = tmp_path / "cache"
+    roomy = make_bare_repo(FIXTURE_FILES, ref="main")
+    ticking = make_bare_repo(FIXTURE_FILES, ref="main")
+    seeded = make_bare_repo(FIXTURE_FILES, ref="main")
+    empty = make_bare_repo(FIXTURE_FILES, ref="main")
+
+    # 'seeded' already holds a healthy last-good checkout from a prior run; its
+    # source then disappears, so startup falls back to serving that checkout.
+    clone_owner(seeded.url, seeded.ref, cache_dir / "seeded")
+    shutil.rmtree(seeded.bare_dir)
+    # 'empty' has no checkout at all and its source is gone: nothing to serve.
+    shutil.rmtree(empty.bare_dir)
+
+    clock = FakeClock()
+    app = create_app(
+        Registry(
+            owners={
+                "roomy": OwnerSpec(url=roomy.url, ref=roomy.ref, ttl=3600),
+                "ticking": OwnerSpec(url=ticking.url, ref=ticking.ref, ttl=60),
+                "seeded": OwnerSpec(url=seeded.url, ref=seeded.ref, ttl=60),
+                "empty": OwnerSpec(url=empty.url, ref=empty.ref, ttl=60),
+            }
+        ),
+        cache_dir,
+        clock=clock,
+    )
+    waited = ("roomy", "ticking", "seeded", "empty")
+
+    async def scenario() -> tuple[httpx.Response, httpx.Response]:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as client:
+                for owner in waited:
+                    await asyncio.wait_for(
+                        app.state.owners[owner].ready.wait(), timeout=15
+                    )
+                # 120s past the load stamp: inside roomy's 3600s TTL, outside
+                # ticking's 60s one. /status is a pure read, so no owner refreshes.
+                clock.advance(120)
+                return (
+                    await client.get("/status"),
+                    await client.get("/status", params={"artifacts": "true"}),
+                )
+
+    plain, with_artifacts = asyncio.run(scenario())
+    owners = plain.json()["owners"]
+
+    assert {name: _freshness_of(owners[name]) for name in waited} == {
+        "roomy": "fresh",
+        "ticking": "stale_ttl",
+        "seeded": "stale",
+        "empty": "unknown",
+    }
+    # Each verdict agrees with the primitives rendered beside it.
+    assert owners["roomy"]["source_available"] is True
+    assert owners["ticking"]["last_pulled_age_seconds"] == 120  # > its 60s ttl
+    assert owners["ticking"]["source_available"] is True  # past-TTL, not offline
+    assert owners["seeded"]["source_available"] is False
+    assert owners["seeded"]["served_commit"] is not None  # serving last-good
+    assert owners["empty"]["state"] == "failed"
+    assert owners["empty"]["served_commit"] is None
+    # No-commit outranks source-down, and 'unknown' is NOT the 'stale' boolean.
+    assert owners["empty"]["source_available"] is False
+    assert owners["empty"]["stale"] is False
+    # The verdict is always-on: ?artifacts=true carries the identical values.
+    artifact_owners = with_artifacts.json()["owners"]
+    assert {name: artifact_owners[name]["freshness"] for name in waited} == {
+        name: owners[name]["freshness"] for name in waited
+    }
+
+
+def test_status_freshness_is_unknown_while_an_owner_is_still_loading(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other no-commit path: an in-flight clone reads ``unknown``, not ``fresh``.
+
+    ``source_available`` starts optimistically ``True`` and no pull has failed, so
+    only the commit check keeps a still-loading owner out of ``fresh``.
+    """
+    slow = make_bare_repo(FIXTURE_FILES, ref="main")
+    release = threading.Event()
+    real_clone = clone_owner
+
+    def gated_clone(
+        url: str,
+        ref: str,
+        dest: Path,
+        *,
+        credentials: Mapping[str, Credential] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> Path:
+        if url == slow.url:  # hold the clone open in its worker thread
+            release.wait(timeout=30)
+        return real_clone(url, ref, dest, credentials=credentials, env=env)
+
+    monkeypatch.setattr(owner_cache_module, "clone_owner", gated_clone)
+    app = create_app(
+        Registry(owners={"slow": OwnerSpec(url=slow.url, ref=slow.ref)}),
+        tmp_path / "cache",
+    )
+
+    async def scenario() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as client:
+                try:
+                    return await asyncio.wait_for(client.get("/status"), timeout=10)
+                finally:
+                    release.set()  # let the clone finish for a clean shutdown
+
+    entry = asyncio.run(scenario()).json()["owners"]["slow"]
+
+    assert entry["state"] == "loading"
+    assert entry["source_available"] is True  # optimistic: no attempt has failed
+    assert _freshness_of(entry) == "unknown"
+
+
+def test_status_freshness_ttl_boundary_is_exclusive_and_a_refresh_restores_fresh(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """``stale_ttl`` starts strictly *past* the TTL, and a pull clears it.
+
+    Pins the boundary the semantics doc states (age exactly equal to the TTL is
+    still ``fresh``) and the ``stale_ttl -> fresh`` transition: unlike ``stale``,
+    which needs the source to come back, ``stale_ttl`` self-clears on the next
+    successful pull — here an explicit ``POST /{owner}/refresh``.
+    """
+    acme = make_bare_repo(FIXTURE_FILES, ref="main")
+    clock = FakeClock()  # the load pull stamps last_pulled at 0
+    app = create_app(
+        Registry(owners={"acme": OwnerSpec(url=acme.url, ref=acme.ref, ttl=60)}),
+        tmp_path / "cache",
+        clock=clock,
+    )
+
+    async def scenario() -> tuple[dict[str, Any], ...]:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as client:
+                await asyncio.wait_for(
+                    app.state.owners["acme"].ready.wait(), timeout=15
+                )
+
+                async def entry() -> dict[str, Any]:
+                    body = (await client.get("/status")).json()
+                    return dict(body["owners"]["acme"])
+
+                just_loaded = await entry()
+                clock.advance(60)  # age == ttl exactly
+                at_boundary = await entry()
+                clock.advance(1)  # age == ttl + 1
+                past_boundary = await entry()
+                await client.post("/acme/refresh")  # a successful pull re-stamps
+                refreshed = await entry()
+                return just_loaded, at_boundary, past_boundary, refreshed
+
+    just_loaded, at_boundary, past_boundary, refreshed = asyncio.run(scenario())
+
+    assert _freshness_of(just_loaded) == "fresh"
+    assert at_boundary["last_pulled_age_seconds"] == 60
+    assert _freshness_of(at_boundary) == "fresh"  # exclusive: > ttl, not >= ttl
+    assert past_boundary["last_pulled_age_seconds"] == 61
+    assert _freshness_of(past_boundary) == "stale_ttl"
+    # The refresh re-stamped the success clock, so the age falls back to zero.
+    assert refreshed["last_pulled_age_seconds"] == 0
+    assert _freshness_of(refreshed) == "fresh"
+
+
+def test_status_freshness_source_down_outranks_past_ttl_and_then_heals(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """The precedence rule itself: an owner that is past TTL *and* offline is ``stale``.
+
+    Walks one owner through the whole transition table in order — ``fresh`` ->
+    ``stale_ttl`` (clock crosses the TTL) -> ``stale`` (a pull attempt fails) ->
+    ``fresh`` (a later pull succeeds). The third step is the one that pins the
+    precedence: a failed pull leaves the *success* clock frozen, so the owner is
+    simultaneously past-TTL and source-down, and ``stale`` must win — "a refresh is
+    due" is meaningless while the source is unreachable. Unlike ``stale_ttl``, this
+    state does not clear on a clock tick; only the source returning clears it.
+    """
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    offline = source.bare_dir.parent / "repo.git.offline"
+    clock = FakeClock()  # the startup pull stamps last_pulled at 0
+    app = create_app(
+        Registry(owners={"acme": OwnerSpec(url=source.url, ref=source.ref, ttl=60)}),
+        tmp_path / "cache",
+        clock=clock,
+    )
+
+    async def scenario() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as client:
+                await asyncio.wait_for(
+                    app.state.owners["acme"].ready.wait(), timeout=15
+                )
+
+                async def entry() -> dict[str, Any]:
+                    body = (await client.get("/status")).json()
+                    return dict(body["owners"]["acme"])
+
+                clock.advance(600)  # far past the 60s ttl, source still reachable
+                past_ttl = await entry()
+                # The source disappears; the forced pull fails (502) and flips
+                # source_available without touching the frozen success clock.
+                source.bare_dir.rename(offline)
+                failed_refresh = await client.post("/acme/refresh")
+                assert failed_refresh.status_code == 502
+                outage = await entry()
+                yaml_text = (
+                    await client.get("/status", params={"format": "yaml"})
+                ).text
+                offline.rename(source.bare_dir)  # the source comes back
+                assert (await client.post("/acme/refresh")).status_code == 200
+                return past_ttl, outage, await entry(), yaml_text
+
+    past_ttl, outage, healed, yaml_text = asyncio.run(scenario())
+
+    # Source up but past TTL: a refresh is due, and that is all.
+    assert past_ttl["source_available"] is True
+    assert _freshness_of(past_ttl) == "stale_ttl"
+    # Same age, now with the source down: the offline verdict outranks the TTL one.
+    assert outage["last_pulled_age_seconds"] == past_ttl["last_pulled_age_seconds"]
+    assert outage["source_available"] is False
+    assert outage["served_commit"] == past_ttl["served_commit"]  # still last-good
+    assert _freshness_of(outage) == "stale"
+    # The verdict survives the YAML rendering unchanged.
+    assert yaml.safe_load(yaml_text)["owners"]["acme"]["freshness"] == "stale"
+    # Only the source returning clears it.
+    assert _freshness_of(healed) == "fresh"
+    assert healed["source_available"] is True
 
 
 def test_status_artifacts_round_trip_through_yaml(
