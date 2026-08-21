@@ -55,10 +55,13 @@ The order is load-bearing, and each step exists for a reason:
   next request, while a `stale` one cannot until the source returns.
 - **The TTL comparison is strictly greater-than.** An age exactly equal to the
   TTL is still `fresh`; `stale_ttl` starts one second past it.
-- **An unknown age falls through to `fresh`.** If a commit is on hand and the
-  source is reachable but no successful pull has stamped an age
-  (`last_pulled_age_seconds: null`), there is no age to call past-TTL, so the
-  verdict is `fresh`.
+- **An unknown age falls through to `fresh`** — defensively. If a commit were on
+  hand and the source reachable but no successful pull had stamped an age
+  (`last_pulled_age_seconds: null`), there would be no age to call past-TTL, so
+  the verdict would be `fresh`. This combination is **not reachable today**: the
+  only code path that sets `source_available` back to `true` also stamps the
+  success clock in the same step. It is specified so the rule stays total, not
+  because a consumer will observe it.
 
 ### Relationship to the existing `stale` boolean
 
@@ -70,9 +73,10 @@ freshness == "stale"   if and only if   stale == true
 ```
 
 A consumer written against `stale` and one written against `freshness` can never
-disagree. Note the asymmetry this implies and the precedence guarantees: an
-owner with `stale: false` may still be `stale_ttl` or `unknown` — **`stale:
-false` does not mean `fresh`.** Only `freshness == "fresh"` means fresh.
+disagree. What the boolean cannot tell you is the rest: `stale: false` only rules
+the `stale` verdict out, leaving `fresh`, `stale_ttl`, and `unknown` all still
+possible — **`stale: false` does not mean fresh.** Only `freshness == "fresh"`
+means fresh, which is the whole reason the enum exists alongside the boolean.
 
 ## 3. Transitions
 

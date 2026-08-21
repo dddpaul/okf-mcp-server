@@ -886,6 +886,53 @@ def test_status_freshness_ttl_boundary_is_exclusive_and_a_refresh_restores_fresh
     assert _freshness_of(refreshed) == "fresh"
 
 
+def test_status_freshness_is_stale_when_the_source_falls_over_inside_the_ttl(
+    make_bare_repo: Callable[..., GitRepoFixture],
+    tmp_path: Path,
+) -> None:
+    """``fresh -> stale`` fires on the failed pull alone, with the age still tiny.
+
+    The companion to the past-TTL case: source-down must win *regardless* of age,
+    not merely when the age happens to have crossed the TTL. A generous TTL keeps
+    the owner well inside its window while an explicit refresh fails, so the only
+    thing that can move the verdict off ``fresh`` is ``source_available``.
+    """
+    source = make_bare_repo(FIXTURE_FILES, ref="main")
+    clock = FakeClock()
+    app = create_app(
+        Registry(owners={"acme": OwnerSpec(url=source.url, ref=source.ref, ttl=3600)}),
+        tmp_path / "cache",
+        clock=clock,
+    )
+
+    async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://gateway.test"
+            ) as client:
+                await asyncio.wait_for(
+                    app.state.owners["acme"].ready.wait(), timeout=15
+                )
+
+                async def entry() -> dict[str, Any]:
+                    body = (await client.get("/status")).json()
+                    return dict(body["owners"]["acme"])
+
+                before = await entry()
+                shutil.rmtree(source.bare_dir)  # the source falls over
+                assert (await client.post("/acme/refresh")).status_code == 502
+                return before, await entry()
+
+    before, after = asyncio.run(scenario())
+
+    assert _freshness_of(before) == "fresh"
+    # Still comfortably inside the 3600s TTL — the age never moved at all.
+    assert after["last_pulled_age_seconds"] == before["last_pulled_age_seconds"] == 0
+    assert after["source_available"] is False
+    assert _freshness_of(after) == "stale"
+
+
 def test_status_freshness_source_down_outranks_past_ttl_and_then_heals(
     make_bare_repo: Callable[..., GitRepoFixture],
     tmp_path: Path,

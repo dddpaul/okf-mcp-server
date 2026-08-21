@@ -395,8 +395,9 @@ def _owner_status(
         owners: The app's per-owner runtime states, keyed by owner name.
         artifacts: When true, add an ``artifacts`` array to every owner entry —
             empty for an owner with no docs on hand (loading or failed). When
-            false (the default) the key is absent entirely, leaving the payload
-            byte-identical to what it was before artifacts existed.
+            false (the default) the key is absent entirely, so the inventory is
+            the *only* thing this flag adds; every other key, ``freshness``
+            included, is identical either way.
 
     Returns:
         A JSON/YAML-serializable mapping with a top-level ``summary`` counts block

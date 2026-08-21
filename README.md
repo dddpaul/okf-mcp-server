@@ -296,7 +296,7 @@ default; `?format=yaml` returns the same structure as YAML, and any other
       "state": "serving", "ref": "main", "served_commit": "1a2b3c4d…",
       "source_available": true, "stale": false, "freshness": "fresh",
       "docs_loaded": 42, "last_pulled_at": "2026-07-17T07:46:46Z",
-      "last_pulled_age_seconds": 340,
+      "last_pulled_age_seconds": 40,
       "last_pull_attempt_at": "2026-07-17T07:46:46Z", "last_pull_error": null
     },
     "beta": {
@@ -316,6 +316,13 @@ A **stale** owner (source down, healthy checkout) instead looks like `acme` with
 `"freshness": "stale"`, its `served_commit` frozen at the pre-outage SHA,
 `last_pulled_at` unchanged, and a fresh `last_pull_attempt_at` on every request
 until the source returns.
+
+```sh
+curl -fsS http://localhost:8080/status \
+  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # JSON (default)
+curl -fsS "http://localhost:8080/status?format=yaml" \
+  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # YAML
+```
 
 #### The `freshness` verdict
 
@@ -339,9 +346,9 @@ unreachable. The TTL comparison is strictly greater-than, so an age exactly equa
 to the TTL is still `fresh`.
 
 `freshness == "stale"` **iff** `stale == true`, so the pre-existing boolean stays
-authoritative for consumers already reading it. The converse does not hold:
-`stale: false` can still be `stale_ttl` or `unknown` — only `freshness ==
-"fresh"` means fresh.
+authoritative for consumers already reading it. What the boolean cannot tell you
+is the rest: `stale: false` only rules the `stale` verdict out — the owner may
+still be `stale_ttl` or `unknown`. Only `freshness == "fresh"` means fresh.
 
 > **`fresh` is serving-freshness, not source-freshness.** It means "current as of
 > my last successful source contact, within TTL" — **not** "the source has not
@@ -355,13 +362,6 @@ that moves as a unit. Mesh-level conclusions such as `blocked_upstream` are
 derived **by the consumer** from `unknown`/`stale`; the gateway never emits them.
 Full normative definition, transition table, and producer/consumer boundary:
 `backlog doc view doc-2` (*Owner Freshness Semantics*).
-
-```sh
-curl -fsS http://localhost:8080/status \
-  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # JSON (default)
-curl -fsS "http://localhost:8080/status?format=yaml" \
-  -H "Authorization: Bearer $OKF_GATEWAY_TOKEN"        # YAML
-```
 
 #### Per-doc artifact inventory: `?artifacts=true`
 
